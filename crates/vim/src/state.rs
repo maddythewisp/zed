@@ -15,7 +15,7 @@ use editor::display_map::{is_invisible, replacement};
 use editor::{Anchor, ClipboardSelection, Editor, MultiBuffer, ToPoint as EditorToPoint};
 use gpui::{
     Action, App, AppContext, BorrowAppContext, ClipboardEntry, ClipboardItem, DismissEvent, Entity,
-    EntityId, Global, HighlightStyle, StyledText, Subscription, Task, TextStyle, WeakEntity,
+    EntityId, Global, HighlightStyle, Subscription, Task, TextElement, TextStyle, WeakEntity,
 };
 use language::{Buffer, BufferEvent, BufferId, Chunk, Point};
 use multi_buffer::MultiBufferRow;
@@ -1292,7 +1292,7 @@ impl PickerDelegate for RegistersViewDelegate {
                 .h(theme.buffer_font_size(cx) * theme.line_height())
                 .px_2()
                 .gap_1()
-                .child(StyledText::new(output).with_default_highlights(&text_style, runs)),
+                .child(output.with_default_highlights(&text_style, runs)),
         )
     }
 }
@@ -1678,10 +1678,8 @@ impl PickerDelegate for MarksViewDelegate {
                 .text_buffer(cx)
                 .h(theme.buffer_font_size(cx) * theme.line_height())
                 .px_2()
-                .child(StyledText::new(left_output).with_default_highlights(&text_style, left_runs))
-                .child(
-                    StyledText::new(right_output).with_default_highlights(&text_style, right_runs),
-                ),
+                .child(left_output.with_default_highlights(&text_style, left_runs))
+                .child(right_output.with_default_highlights(&text_style, right_runs)),
         )
     }
 }

@@ -4,11 +4,10 @@ use crate::{Checkbox, ListBulletItem, ToggleState};
 use gpui::Action;
 use gpui::FocusHandle;
 use gpui::IntoElement;
-use gpui::Stateful;
 use smallvec::{SmallVec, smallvec};
 use theme::ActiveTheme;
 
-type ActionHandler = Box<dyn FnOnce(Stateful<Div>) -> Stateful<Div>>;
+type ActionHandler = Box<dyn FnOnce(Div) -> Div>;
 
 #[derive(IntoElement, RegisterComponent)]
 pub struct AlertModal {

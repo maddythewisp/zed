@@ -1,7 +1,6 @@
 mod anchored;
 mod animation;
 mod canvas;
-mod deferred;
 mod div;
 mod image_cache;
 mod img;
@@ -10,11 +9,11 @@ mod surface;
 mod svg;
 mod text;
 mod uniform_list;
+mod virtualized_list;
 
 pub use anchored::*;
 pub use animation::*;
 pub use canvas::*;
-pub use deferred::*;
 pub use div::*;
 pub use image_cache::*;
 pub use img::*;

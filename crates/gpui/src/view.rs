@@ -1,32 +1,18 @@
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, Context, Element, ElementId,
+    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
+    RenderNode, Size, UpdateResult, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
-use collections::FxHashSet;
-use refineable::Refineable;
-use std::mem;
-use std::rc::Rc;
-use std::{any::TypeId, fmt, ops::Range};
+use std::{any::TypeId, fmt};
+use taffy::style::{Dimension, Style as TaffyStyle};
 
-struct AnyViewState {
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    cache_key: ViewCacheKey,
-    accessed_entities: FxHashSet<EntityId>,
-}
-
-#[derive(Default)]
-struct ViewCacheKey {
-    bounds: Bounds<Pixels>,
-    content_mask: ContentMask<Pixels>,
-    text_style: TextStyle,
-}
+#[doc(hidden)]
+pub struct ViewLayoutState;
 
 impl<V: Render> Element for Entity<V> {
-    type RequestLayoutState = AnyElement;
+    type RequestLayoutState = ViewLayoutState;
     type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
@@ -41,40 +27,156 @@ impl<V: Render> Element for Entity<V> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut element = self.update(cx, |view, cx| view.render(window, cx).into_any_element());
-        let layout_id = window.with_rendered_view(self.entity_id(), |window| {
-            element.request_layout(window, cx)
-        });
-        (layout_id, element)
+        unreachable!("Entity<V: Render> uses retained node path")
     }
 
     fn prepaint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
+        _bounds: Bounds<Pixels>,
+        _element: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
     ) {
-        window.set_view_id(self.entity_id());
-        window.with_rendered_view(self.entity_id(), |window| element.prepaint(window, cx));
+        unreachable!("Entity<V: Render> uses retained node path")
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
+        _bounds: Bounds<Pixels>,
+        _element: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut App,
     ) {
-        window.with_rendered_view(self.entity_id(), |window| element.paint(window, cx));
+        unreachable!("Entity<V: Render> uses retained node path")
+    }
+
+    fn as_any_view(&self) -> Option<AnyView> {
+        Some(AnyView::from(self.clone()))
+    }
+
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<ViewNode>())
+    }
+
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        Some(Box::new(ViewNode::new(self.entity_id())))
+    }
+
+    fn update_render_node(
+        &mut self,
+        node: &mut dyn RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        let view_node = node.as_any_mut().downcast_mut::<ViewNode>()?;
+        // View identity is stable (EntityId doesn't change), so nothing to update
+        debug_assert_eq!(view_node.view_id, self.entity_id());
+        Some(UpdateResult::UNCHANGED)
+    }
+}
+
+/// Retained render node for view elements.
+///
+/// Views are boundaries in the component tree. The ViewNode itself doesn't render anything -
+/// it just marks the boundary and delegates to the view's rendered element tree (which is
+/// expanded during reconciliation via `expand_view_fibers`).
+pub(crate) struct ViewNode {
+    view_id: EntityId,
+}
+
+impl ViewNode {
+    pub(crate) fn new(view_id: EntityId) -> Self {
+        Self { view_id }
+    }
+}
+
+impl RenderNode for ViewNode {
+    fn taffy_style(&self, _rem_size: Pixels, _scale_factor: f32) -> TaffyStyle {
+        // Views are layout-transparent - their child element determines the layout
+        TaffyStyle {
+            size: taffy::prelude::Size {
+                width: Dimension::auto(),
+                height: Dimension::auto(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn compute_intrinsic_size(
+        &mut self,
+        _ctx: &mut crate::SizingCtx,
+    ) -> crate::IntrinsicSizeResult {
+        crate::IntrinsicSizeResult {
+            size: crate::IntrinsicSize::default(),
+            input: crate::SizingInput::default(),
+        }
+    }
+
+    fn measure(
+        &mut self,
+        _known: Size<Option<Pixels>>,
+        _available: Size<AvailableSpace>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Size<Pixels>> {
+        // Views don't have intrinsic size - layout comes from their children
+        None
+    }
+
+    fn layout_begin(&mut self, ctx: &mut crate::LayoutCtx) -> crate::LayoutFrame {
+        // Register this view fiber in view_roots so expand_view_fibers can find it
+        // and render the view's content
+        ctx.window
+            .fiber
+            .tree
+            .set_view_root(self.view_id, ctx.fiber_id);
+
+        // Push view boundary for scope tracking
+        ctx.window.rendered_entity_stack.push(self.view_id);
+        crate::LayoutFrame {
+            handled: true,
+            pushed_view_boundary: true,
+            ..Default::default()
+        }
+    }
+
+    fn layout_end(&mut self, ctx: &mut crate::LayoutCtx, frame: crate::LayoutFrame) {
+        if frame.pushed_view_boundary {
+            ctx.window.rendered_entity_stack.pop();
+        }
+    }
+
+    fn prepaint_begin(&mut self, ctx: &mut crate::PrepaintCtx) -> crate::PrepaintFrame {
+        // Set the view context for prepaint
+        ctx.window.set_view_id(self.view_id);
+        crate::PrepaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_end(&mut self, _ctx: &mut crate::PrepaintCtx, _frame: crate::PrepaintFrame) {
+        // Nothing to pop - view context is per-frame
+    }
+
+    fn paint_begin(&mut self, _ctx: &mut crate::PaintCtx) -> crate::PaintFrame {
+        // Views don't paint anything themselves - their children do
+        crate::PaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn paint_end(&mut self, _ctx: &mut crate::PaintCtx, _frame: crate::PaintFrame) {
+        // Nothing to clean up
     }
 }
 
@@ -83,7 +185,6 @@ impl<V: Render> Element for Entity<V> {
 pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
-    cached_style: Option<Rc<StyleRefinement>>,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -91,20 +192,11 @@ impl<V: Render> From<Entity<V>> for AnyView {
         AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
-            cached_style: None,
         }
     }
 }
 
 impl AnyView {
-    /// Indicate that this view should be cached when using it as an element.
-    /// When using this method, the view's previous layout and paint will be recycled from the previous frame if [Context::notify] has not been called since it was rendered.
-    /// The one exception is when [Window::refresh] is called, in which case caching is ignored.
-    pub fn cached(mut self, style: StyleRefinement) -> Self {
-        self.cached_style = Some(style.into());
-        self
-    }
-
     /// Convert this to a weak handle.
     pub fn downgrade(&self) -> AnyWeakView {
         AnyWeakView {
@@ -121,7 +213,6 @@ impl AnyView {
             Err(entity) => Err(Self {
                 entity,
                 render: self.render,
-                cached_style: self.cached_style,
             }),
         }
     }
@@ -135,6 +226,11 @@ impl AnyView {
     pub fn entity_id(&self) -> EntityId {
         self.entity.entity_id()
     }
+
+    /// Render this view to an AnyElement.
+    pub(crate) fn render_element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.render)(self, window, cx)
+    }
 }
 
 impl PartialEq for AnyView {
@@ -146,8 +242,8 @@ impl PartialEq for AnyView {
 impl Eq for AnyView {}
 
 impl Element for AnyView {
-    type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = Option<AnyElement>;
+    type RequestLayoutState = ViewLayoutState;
+    type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
         Some(ElementId::View(self.entity_id()))
@@ -161,135 +257,58 @@ impl Element for AnyView {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        window.with_rendered_view(self.entity_id(), |window| {
-            // Disable caching when inspecting so that mouse_hit_test has all hitboxes.
-            let caching_disabled = window.is_inspector_picking(cx);
-            match self.cached_style.as_ref() {
-                Some(style) if !caching_disabled => {
-                    let mut root_style = Style::default();
-                    root_style.refine(style);
-                    let layout_id = window.request_layout(root_style, None, cx);
-                    (layout_id, None)
-                }
-                _ => {
-                    let mut element = (self.render)(self, window, cx);
-                    let layout_id = element.request_layout(window, cx);
-                    (layout_id, Some(element))
-                }
-            }
-        })
+        unreachable!("AnyView uses retained node path")
     }
 
     fn prepaint(
         &mut self,
-        global_id: Option<&GlobalElementId>,
+        _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<AnyElement> {
-        window.set_view_id(self.entity_id());
-        window.with_rendered_view(self.entity_id(), |window| {
-            if let Some(mut element) = element.take() {
-                element.prepaint(window, cx);
-                return Some(element);
-            }
-
-            window.with_element_state::<AnyViewState, _>(
-                global_id.unwrap(),
-                |element_state, window| {
-                    let content_mask = window.content_mask();
-                    let text_style = window.text_style();
-
-                    if let Some(mut element_state) = element_state
-                        && element_state.cache_key.bounds == bounds
-                        && element_state.cache_key.content_mask == content_mask
-                        && element_state.cache_key.text_style == text_style
-                        && !window.dirty_views.contains(&self.entity_id())
-                        && !window.refreshing
-                    {
-                        let prepaint_start = window.prepaint_index();
-                        window.reuse_prepaint(element_state.prepaint_range.clone());
-                        cx.entities
-                            .extend_accessed(&element_state.accessed_entities);
-                        let prepaint_end = window.prepaint_index();
-                        element_state.prepaint_range = prepaint_start..prepaint_end;
-
-                        return (None, element_state);
-                    }
-
-                    let refreshing = mem::replace(&mut window.refreshing, true);
-                    let prepaint_start = window.prepaint_index();
-                    let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                        let mut element = (self.render)(self, window, cx);
-                        element.layout_as_root(bounds.size.into(), window, cx);
-                        element.prepaint_at(bounds.origin, window, cx);
-                        element
-                    });
-
-                    let prepaint_end = window.prepaint_index();
-                    window.refreshing = refreshing;
-
-                    (
-                        Some(element),
-                        AnyViewState {
-                            accessed_entities,
-                            prepaint_range: prepaint_start..prepaint_end,
-                            paint_range: PaintIndex::default()..PaintIndex::default(),
-                            cache_key: ViewCacheKey {
-                                bounds,
-                                content_mask,
-                                text_style,
-                            },
-                        },
-                    )
-                },
-            )
-        })
+        _bounds: Bounds<Pixels>,
+        _element: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+        unreachable!("AnyView uses retained node path")
     }
 
     fn paint(
         &mut self,
-        global_id: Option<&GlobalElementId>,
+        _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        element: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
+        _element: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut App,
     ) {
-        window.with_rendered_view(self.entity_id(), |window| {
-            let caching_disabled = window.is_inspector_picking(cx);
-            if self.cached_style.is_some() && !caching_disabled {
-                window.with_element_state::<AnyViewState, _>(
-                    global_id.unwrap(),
-                    |element_state, window| {
-                        let mut element_state = element_state.unwrap();
+        unreachable!("AnyView uses retained node path")
+    }
 
-                        let paint_start = window.paint_index();
+    fn as_any_view(&self) -> Option<AnyView> {
+        Some(self.clone())
+    }
 
-                        if let Some(element) = element {
-                            let refreshing = mem::replace(&mut window.refreshing, true);
-                            element.paint(window, cx);
-                            window.refreshing = refreshing;
-                        } else {
-                            window.reuse_paint(element_state.paint_range.clone());
-                        }
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<ViewNode>())
+    }
 
-                        let paint_end = window.paint_index();
-                        element_state.paint_range = paint_start..paint_end;
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        Some(Box::new(ViewNode::new(self.entity_id())))
+    }
 
-                        ((), element_state)
-                    },
-                )
-            } else {
-                element.as_mut().unwrap().paint(window, cx);
-            }
-        });
+    fn update_render_node(
+        &mut self,
+        node: &mut dyn RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        let view_node = node.as_any_mut().downcast_mut::<ViewNode>()?;
+        debug_assert_eq!(view_node.view_id, self.entity_id());
+        Some(UpdateResult::UNCHANGED)
     }
 }
 
@@ -322,7 +341,6 @@ impl AnyWeakView {
         Some(AnyView {
             entity,
             render: self.render,
-            cached_style: None,
         })
     }
 }

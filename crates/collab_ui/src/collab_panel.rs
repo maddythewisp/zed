@@ -17,7 +17,7 @@ use gpui::{
     Div, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, InteractiveElement, IntoElement,
     KeyContext, ListOffset, ListState, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
     Render, SharedString, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
-    anchored, canvas, deferred, div, fill, list, point, prelude::*, px,
+    anchored, canvas, div, fill, list, point, prelude::*, px,
 };
 use menu::{Cancel, Confirm, SecondaryConfirm, SelectNext, SelectPrevious};
 use project::{Fs, Project};
@@ -3081,13 +3081,11 @@ impl Render for CollabPanel {
                 self.render_signed_in(window, cx)
             })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Corner::TopLeft)
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
+                anchored()
+                    .position(*position)
+                    .anchor(gpui::Corner::TopLeft)
+                    .child(menu.clone())
+                    .z_index(1)
             }))
     }
 }

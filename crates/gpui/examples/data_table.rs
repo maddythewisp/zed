@@ -343,26 +343,30 @@ impl DataTable {
                             }
                         });
 
-                        window.on_mouse_event(move |ev: &MouseMoveEvent, _, _, cx| {
-                            if !ev.dragging() {
-                                return;
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            let scroll_handle = scroll_handle.clone();
+                            move |ev: &MouseMoveEvent, _, _, cx| {
+                                if !ev.dragging() {
+                                    return;
+                                }
+
+                                let Some(drag_pos) = entity.read(cx).drag_position else {
+                                    return;
+                                };
+
+                                let inside_offset = drag_pos.y;
+                                let percentage = ((ev.position.y - table_bounds.origin.y
+                                    + inside_offset)
+                                    / (table_bounds.size.height))
+                                    .clamp(0., 1.);
+
+                                let offset_y = ((scroll_height - table_bounds.size.height)
+                                    * percentage)
+                                    .clamp(px(0.), scroll_height - SCROLLBAR_THUMB_HEIGHT);
+                                scroll_handle.set_offset(point(px(0.), -offset_y));
+                                cx.notify(entity.entity_id());
                             }
-
-                            let Some(drag_pos) = entity.read(cx).drag_position else {
-                                return;
-                            };
-
-                            let inside_offset = drag_pos.y;
-                            let percentage = ((ev.position.y - table_bounds.origin.y
-                                + inside_offset)
-                                / (table_bounds.size.height))
-                                .clamp(0., 1.);
-
-                            let offset_y = ((scroll_height - table_bounds.size.height)
-                                * percentage)
-                                .clamp(px(0.), scroll_height - SCROLLBAR_THUMB_HEIGHT);
-                            scroll_handle.set_offset(point(px(0.), -offset_y));
-                            cx.notify(entity.entity_id());
                         })
                     },
                 )
@@ -371,6 +375,8 @@ impl DataTable {
     }
 }
 
+// Example code demonstrating custom scrollbar with on_mouse_event
+#[allow(deprecated)]
 impl Render for DataTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()

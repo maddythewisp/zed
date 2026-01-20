@@ -289,7 +289,7 @@ impl Render for TerminalOutput {
             move |_bounds, _, _| {},
             // paint
             move |bounds, _, window, cx| {
-                for rect in rects {
+                for rect in &rects {
                     rect.paint(
                         bounds.origin,
                         &terminal::TerminalBounds {
@@ -301,7 +301,7 @@ impl Render for TerminalOutput {
                     );
                 }
 
-                for batch in batched_text_runs {
+                for batch in &batched_text_runs {
                     batch.paint(
                         bounds.origin,
                         &terminal::TerminalBounds {

@@ -1,10 +1,14 @@
+use gpui_macros::Element;
+
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
+    App, ElementImpl, IntoElement, ObjectFit, PaintFrame, Pixels, PrepaintFrame,
+    RenderNode, StyleRefinement, Styled, UpdateResult, Window, taffy::ToTaffy,
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
+use std::any::TypeId;
+use taffy::style::Style as TaffyStyle;
 
 /// A source of a surface's content.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +26,8 @@ impl From<CVPixelBuffer> for SurfaceSource {
 }
 
 /// A surface element.
+#[derive(Element)]
+#[element(crate = crate)]
 pub struct Surface {
     source: SurfaceSource,
     object_fit: ObjectFit,
@@ -46,63 +52,38 @@ impl Surface {
     }
 }
 
-impl Element for Surface {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
+impl ElementImpl for Surface {
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        Some(Box::new(SurfaceNode {
+            source: self.source.clone(),
+            object_fit: self.object_fit,
+            style: self.style.clone(),
+        }))
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<SurfaceNode>())
     }
 
-    fn request_layout(
+    fn update_render_node(
         &mut self,
-        _global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut style = Style::default();
-        style.refine(&self.style);
-        let layout_id = window.request_layout(style, [], cx);
-        (layout_id, ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        node: &mut dyn RenderNode,
         _window: &mut Window,
         _cx: &mut App,
-    ) -> Self::PrepaintState {
-    }
+    ) -> Option<UpdateResult> {
+        let node = node.as_any_mut().downcast_mut::<SurfaceNode>()?;
+        let layout_changed = node.style != self.style;
+        let paint_changed =
+            layout_changed || node.source != self.source || node.object_fit != self.object_fit;
 
-    fn paint(
-        &mut self,
-        _global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
-        _: &mut App,
-    ) {
-        match &self.source {
-            #[cfg(target_os = "macos")]
-            SurfaceSource::Surface(surface) => {
-                let size = crate::size(surface.get_width().into(), surface.get_height().into());
-                let new_bounds = self.object_fit.get_bounds(bounds, size);
-                // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
-            }
-            #[allow(unreachable_patterns)]
-            _ => {}
-        }
+        node.source = self.source.clone();
+        node.object_fit = self.object_fit;
+        node.style = self.style.clone();
+
+        Some(UpdateResult {
+            layout_changed,
+            paint_changed,
+        })
     }
 }
 
@@ -117,5 +98,44 @@ impl IntoElement for Surface {
 impl Styled for Surface {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
+    }
+}
+
+struct SurfaceNode {
+    source: SurfaceSource,
+    object_fit: ObjectFit,
+    style: StyleRefinement,
+}
+
+impl RenderNode for SurfaceNode {
+    fn taffy_style(&self, rem_size: Pixels, scale_factor: f32) -> TaffyStyle {
+        let mut style = crate::Style::default();
+        style.refine(&self.style);
+        style.to_taffy(rem_size, scale_factor)
+    }
+
+    fn prepaint_begin(&mut self, _ctx: &mut crate::PrepaintCtx) -> PrepaintFrame {
+        PrepaintFrame {
+            handled: true,
+            skip_children: true,
+            ..Default::default()
+        }
+    }
+
+    fn paint_begin(&mut self, ctx: &mut crate::PaintCtx) -> PaintFrame {
+        #[cfg(target_os = "macos")]
+        match &self.source {
+            SurfaceSource::Surface(surface) => {
+                let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                let new_bounds = self.object_fit.get_bounds(ctx.bounds, size);
+                ctx.window.paint_surface(new_bounds, surface.clone());
+            }
+        }
+
+        PaintFrame {
+            handled: true,
+            skip_children: true,
+            ..Default::default()
+        }
     }
 }

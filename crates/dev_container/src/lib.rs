@@ -15,7 +15,6 @@ use ui::Button;
 use ui::Clickable;
 use ui::FluentBuilder;
 use ui::KeyBinding;
-use ui::StatefulInteractiveElement;
 use ui::Switch;
 use ui::ToggleState;
 use ui::Tooltip;

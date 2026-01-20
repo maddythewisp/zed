@@ -1,6 +1,6 @@
 use gpui::{
     App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString,
-    Stateful, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 
 actions!(example, [Tab, TabPrev]);
@@ -48,7 +48,7 @@ impl Render for Example {
             this.border_3().border_color(gpui::blue())
         }
 
-        fn button(id: impl Into<ElementId>) -> Stateful<Div> {
+        fn button(id: impl Into<ElementId>) -> Div {
             div()
                 .id(id)
                 .h_10()

@@ -8,7 +8,7 @@ use serde_json::json;
 use ui::{Button, ButtonStyle};
 use ui::{
     ButtonCommon, Clickable, Context, FluentBuilder, InteractiveElement, Label, LabelCommon,
-    LabelSize, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    LabelSize, ParentElement, SharedString, Styled, Window, div,
     h_flex, px, v_flex,
 };
 use workspace::{Item, SplitDirection, Workspace};

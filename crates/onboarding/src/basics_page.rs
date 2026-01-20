@@ -10,7 +10,7 @@ use theme::{
     ThemeSettings,
 };
 use ui::{
-    Divider, ParentElement as _, StatefulInteractiveElement, SwitchField, TintColor,
+    Divider, ParentElement as _, SwitchField, TintColor,
     ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonSimple, ToggleButtonWithIcon, Tooltip,
     prelude::*, rems_from_px,
 };

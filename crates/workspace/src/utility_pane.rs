@@ -1,7 +1,4 @@
-use gpui::{
-    AppContext as _, EntityId, MouseButton, Pixels, Render, StatefulInteractiveElement,
-    Subscription, WeakEntity, deferred, px,
-};
+use gpui::{AppContext as _, EntityId, MouseButton, Pixels, Render, Subscription, WeakEntity, px};
 use ui::{
     ActiveTheme as _, Context, FluentBuilder as _, InteractiveElement as _, IntoElement,
     ParentElement as _, RenderOnce, Styled as _, Window, div,
@@ -245,24 +242,22 @@ impl RenderOnce for UtilityPaneFrame {
                 .occlude();
 
             match slot {
-                UtilityPaneSlot::Left => deferred(
-                    handle
-                        .absolute()
-                        .right(-UTILITY_PANE_RESIZE_HANDLE_SIZE / 2.)
-                        .top(px(0.))
-                        .h_full()
-                        .w(UTILITY_PANE_RESIZE_HANDLE_SIZE)
-                        .cursor_col_resize(),
-                ),
-                UtilityPaneSlot::Right => deferred(
-                    handle
-                        .absolute()
-                        .left(-UTILITY_PANE_RESIZE_HANDLE_SIZE / 2.)
-                        .top(px(0.))
-                        .h_full()
-                        .w(UTILITY_PANE_RESIZE_HANDLE_SIZE)
-                        .cursor_col_resize(),
-                ),
+                UtilityPaneSlot::Left => handle
+                    .absolute()
+                    .right(-UTILITY_PANE_RESIZE_HANDLE_SIZE / 2.)
+                    .top(px(0.))
+                    .h_full()
+                    .w(UTILITY_PANE_RESIZE_HANDLE_SIZE)
+                    .cursor_col_resize()
+                    .z_index(0),
+                UtilityPaneSlot::Right => handle
+                    .absolute()
+                    .left(-UTILITY_PANE_RESIZE_HANDLE_SIZE / 2.)
+                    .top(px(0.))
+                    .h_full()
+                    .w(UTILITY_PANE_RESIZE_HANDLE_SIZE)
+                    .cursor_col_resize()
+                    .z_index(0),
             }
         };
 

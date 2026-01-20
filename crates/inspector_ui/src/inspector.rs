@@ -151,7 +151,7 @@ fn render_inspector_id(inspector_id: &InspectorElementId, cx: &App) -> Div {
                 .tooltip(Tooltip::text(
                     "GlobalElementId of the nearest ancestor with an ID",
                 ))
-                .child(inspector_id.path.global_id.to_string()),
+                .child(format!("{:?}", inspector_id.path.global_id)),
         )
 }
 

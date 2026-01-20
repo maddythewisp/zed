@@ -1,13 +1,16 @@
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point, ShapedLine, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
+    AbsoluteLength, AnyElement, App, Bounds, ConditionalSlot, ContentMask, Context,
+    DispatchPhase, ElementId, Entity, ElementImpl, FocusHandle, Font,
+    FontFeatures, FontStyle, FontWeight, GlobalElementId, HighlightStyle, Hitbox,
+    HitboxBehavior, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement, LayoutCtx,
+    LayoutFrame, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, PaintCtx, PaintFrame,
+    Pixels, Point, PrepaintCtx, PrepaintFrame, Refineable, RenderNode, ShapedLine, Size,
+    StrikethroughStyle, Style, Styled, TaffyStyle, TextRun, TextStyle, ToTaffy, UTF16Selection,
+    UnderlineStyle, UpdateResult, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
     size,
 };
+use smallvec::SmallVec;
 use itertools::Itertools;
 use language::CursorShape;
 use settings::Settings;
@@ -48,9 +51,7 @@ pub struct LayoutState {
     dimensions: TerminalBounds,
     mode: TermMode,
     display_offset: usize,
-    hyperlink_tooltip: Option<AnyElement>,
     gutter: Pixels,
-    block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
 }
@@ -280,6 +281,7 @@ fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundReg
 
 /// The GPUI element that paints the terminal.
 /// We need to keep a reference to the model for mouse events, do we need it for any other terminal stuff, or can we move that to connection?
+#[derive(Element)]
 pub struct TerminalElement {
     terminal: Entity<Terminal>,
     terminal_view: Entity<TerminalView>,
@@ -297,8 +299,6 @@ impl InteractiveElement for TerminalElement {
         &mut self.interactivity
     }
 }
-
-impl StatefulInteractiveElement for TerminalElement {}
 
 impl TerminalElement {
     pub fn new(
@@ -652,6 +652,638 @@ impl TerminalElement {
         }
     }
 
+}
+
+/// The retained render node for the terminal element.
+struct TerminalNode {
+    terminal: Entity<Terminal>,
+    terminal_view: Entity<TerminalView>,
+    workspace: WeakEntity<Workspace>,
+    focus: FocusHandle,
+    focused: bool,
+    cursor_visible: bool,
+    mode: TerminalMode,
+    block_below_cursor: Option<Rc<BlockProperties>>,
+    interactivity: Interactivity,
+    /// Cached layout state from prepaint, used during paint.
+    layout: Option<LayoutState>,
+    /// Pending tooltip element for ConditionalSlot.
+    pending_tooltip: Option<AnyElement>,
+    /// Pending block below cursor element for ConditionalSlot.
+    pending_block: Option<AnyElement>,
+    /// Position offset for block element.
+    block_origin: Point<Pixels>,
+    /// Size for block element.
+    block_size: Size<Pixels>,
+    /// Bounds for content clipping.
+    bounds: Bounds<Pixels>,
+    /// Scroll offset from the terminal view.
+    scroll_top: Pixels,
+}
+
+impl TerminalNode {
+    fn new(element: &mut TerminalElement) -> Self {
+        Self {
+            terminal: element.terminal.clone(),
+            terminal_view: element.terminal_view.clone(),
+            workspace: element.workspace.clone(),
+            focus: element.focus.clone(),
+            focused: element.focused,
+            cursor_visible: element.cursor_visible,
+            mode: element.mode.clone(),
+            block_below_cursor: element.block_below_cursor.take(),
+            interactivity: std::mem::take(&mut element.interactivity),
+            layout: None,
+            pending_tooltip: None,
+            pending_block: None,
+            block_origin: Point::default(),
+            block_size: Size::default(),
+            bounds: Bounds::default(),
+            scroll_top: px(0.),
+        }
+    }
+
+    fn rem_size(&self, cx: &mut App) -> Option<Pixels> {
+        let settings = ThemeSettings::get_global(cx).clone();
+        let buffer_font_size = settings.buffer_font_size(cx);
+        let rem_size_scale = {
+            let default_font_size_scale = 14. / ui::BASE_REM_SIZE_IN_PX;
+            let default_font_size_delta = 1. - default_font_size_scale;
+            f32::from(buffer_font_size) / ui::BASE_REM_SIZE_IN_PX + default_font_size_delta
+        };
+        Some(buffer_font_size * rem_size_scale)
+    }
+}
+
+impl RenderNode for TerminalNode {
+    fn taffy_style(&self, rem_size: Pixels, scale_factor: f32) -> TaffyStyle {
+        let mut style = Style::default();
+        style.refine(&self.interactivity.base_style);
+        style.to_taffy(rem_size, scale_factor)
+    }
+
+    fn layout_begin(&mut self, ctx: &mut LayoutCtx) -> LayoutFrame {
+        let height: Length = match self.terminal_view.read(ctx.cx).content_mode(ctx.window, ctx.cx) {
+            ContentMode::Inline {
+                displayed_lines,
+                total_lines: _,
+            } => {
+                let rem_size = ctx.window.rem_size();
+                let line_height = f32::from(ctx.window.text_style().font_size.to_pixels(rem_size))
+                    * TerminalSettings::get_global(ctx.cx).line_height.value();
+                px(displayed_lines as f32 * line_height).into()
+            }
+            ContentMode::Scrollable => {
+                if let TerminalMode::Embedded { .. } = &self.mode {
+                    let term = self.terminal.read(ctx.cx);
+                    if !term.scrolled_to_top() && !term.scrolled_to_bottom() && self.focused {
+                        self.interactivity.occlude_mouse();
+                    }
+                }
+                relative(1.).into()
+            }
+        };
+
+        self.interactivity.base_style.size.width = Some(relative(1.).into());
+        self.interactivity.base_style.size.height = Some(height);
+
+        LayoutFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn layout_end(&mut self, _ctx: &mut LayoutCtx, _frame: LayoutFrame) {}
+
+    fn conditional_slots(&mut self, _fiber_id: GlobalElementId) -> SmallVec<[ConditionalSlot; 4]> {
+        let mut slots = SmallVec::new();
+
+        // Slot 0: Hyperlink tooltip
+        if let Some(tooltip_element) = self.pending_tooltip.take() {
+            slots.push(ConditionalSlot::active(0, move || tooltip_element));
+        } else {
+            slots.push(ConditionalSlot {
+                slot_index: 0,
+                active: false,
+                element_factory: None,
+            });
+        }
+
+        // Slot 1: Block below cursor
+        if let Some(block_element) = self.pending_block.take() {
+            let origin = self.block_origin;
+            let block_size = self.block_size;
+            slots.push(ConditionalSlot::active(1, move || {
+                div()
+                    .occlude()
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .w(block_size.width)
+                    .h(block_size.height)
+                    .child(block_element)
+                    .into_any_element()
+            }));
+        } else {
+            slots.push(ConditionalSlot {
+                slot_index: 1,
+                active: false,
+                element_factory: None,
+            });
+        }
+
+        slots
+    }
+
+    fn prepaint_begin(&mut self, ctx: &mut PrepaintCtx) -> PrepaintFrame {
+        let bounds = ctx.bounds;
+        self.bounds = bounds;
+        let _rem_size = self.rem_size(ctx.cx);
+        self.scroll_top = self.terminal_view.read(ctx.cx).scroll_top;
+
+        let hitbox = ctx.insert_hitbox(bounds, HitboxBehavior::Normal);
+
+        let settings = ThemeSettings::get_global(ctx.cx).clone();
+        let buffer_font_size = settings.buffer_font_size(ctx.cx);
+
+        let terminal_settings = TerminalSettings::get_global(ctx.cx);
+        let minimum_contrast = terminal_settings.minimum_contrast;
+
+        let font_family = terminal_settings.font_family.as_ref().map_or_else(
+            || settings.buffer_font.family.clone(),
+            |font_family| font_family.0.clone().into(),
+        );
+
+        let font_fallbacks = terminal_settings
+            .font_fallbacks
+            .as_ref()
+            .or(settings.buffer_font.fallbacks.as_ref())
+            .cloned();
+
+        let font_features = terminal_settings
+            .font_features
+            .as_ref()
+            .unwrap_or(&FontFeatures::disable_ligatures())
+            .clone();
+
+        let font_weight = terminal_settings.font_weight.unwrap_or_default();
+        let line_height = terminal_settings.line_height.value();
+
+        let font_size = match &self.mode {
+            TerminalMode::Embedded { .. } => {
+                ctx.window.text_style().font_size.to_pixels(ctx.window.rem_size())
+            }
+            TerminalMode::Standalone => terminal_settings
+                .font_size
+                .map_or(buffer_font_size, |size| theme::adjusted_font_size(size, ctx.cx)),
+        };
+
+        let theme = ctx.cx.theme().clone();
+
+        let link_style = HighlightStyle {
+            color: Some(theme.colors().link_text_hover),
+            font_weight: Some(font_weight),
+            font_style: None,
+            background_color: None,
+            underline: Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(theme.colors().link_text_hover),
+                wavy: false,
+            }),
+            strikethrough: None,
+            fade_out: None,
+        };
+
+        let text_style = TextStyle {
+            font_family,
+            font_features,
+            font_weight,
+            font_fallbacks,
+            font_size: font_size.into(),
+            font_style: FontStyle::Normal,
+            line_height: px(line_height).into(),
+            background_color: Some(theme.colors().terminal_ansi_background),
+            white_space: WhiteSpace::Normal,
+            color: theme.colors().terminal_foreground,
+            ..Default::default()
+        };
+
+        let text_system = ctx.cx.text_system();
+        let player_color = theme.players().local();
+        let match_color = theme.colors().search_match_background;
+        let gutter;
+        let (dimensions, line_height_px) = {
+            let rem_size = ctx.window.rem_size();
+            let font_pixels = text_style.font_size.to_pixels(rem_size);
+            let line_height = f32::from(font_pixels) * line_height;
+            let font_id = ctx.cx.text_system().resolve_font(&text_style.font());
+
+            let cell_width = text_system
+                .advance(font_id, font_pixels, 'm')
+                .unwrap()
+                .width;
+            gutter = cell_width;
+
+            let mut size = bounds.size;
+            size.width -= gutter;
+
+            if size.width < cell_width * 2.0 {
+                size.width = cell_width * 2.0;
+            }
+
+            let mut origin = bounds.origin;
+            origin.x += gutter;
+
+            (
+                TerminalBounds::new(px(line_height), cell_width, Bounds { origin, size }),
+                line_height,
+            )
+        };
+
+        let search_matches = self.terminal.read(ctx.cx).matches.clone();
+        let background_color = theme.colors().terminal_background;
+
+        let scroll_top = self.terminal_view.read(ctx.cx).scroll_top;
+        let (last_hovered_word, hover_tooltip) =
+            self.terminal.update(ctx.cx, |terminal, cx| {
+                terminal.set_size(dimensions);
+                terminal.sync(ctx.window, cx);
+
+                if ctx.window.modifiers().secondary()
+                    && bounds.contains(&ctx.window.mouse_position())
+                    && self.terminal_view.read(cx).hover.is_some()
+                {
+                    let registered_hover = self.terminal_view.read(cx).hover.as_ref();
+                    if terminal.last_content.last_hovered_word.as_ref()
+                        == registered_hover.map(|hover| &hover.hovered_word)
+                    {
+                        (
+                            terminal.last_content.last_hovered_word.clone(),
+                            registered_hover.map(|hover| hover.tooltip.clone()),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            });
+
+        // Prepare hyperlink tooltip element for ConditionalSlot
+        if let Some(hover_tooltip_text) = hover_tooltip {
+            let offset = bounds.origin + point(gutter, px(0.)) - point(px(0.), scroll_top);
+            self.pending_tooltip = Some(
+                div()
+                    .absolute()
+                    .left(offset.x)
+                    .top(offset.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .id("terminal-tooltip")
+                    .tooltip(Tooltip::text(hover_tooltip_text))
+                    .into_any_element(),
+            );
+        }
+
+        let TerminalContent {
+            cells,
+            mode,
+            display_offset,
+            cursor_char,
+            selection,
+            cursor,
+            ..
+        } = &self.terminal.read(ctx.cx).last_content;
+        let mode = *mode;
+        let display_offset = *display_offset;
+
+        let mut relative_highlighted_ranges = Vec::new();
+        for search_match in search_matches {
+            relative_highlighted_ranges.push((search_match, match_color))
+        }
+        if let Some(selection) = selection {
+            relative_highlighted_ranges
+                .push((selection.start..=selection.end, player_color.selection));
+        }
+
+        let content_mode = self.terminal_view.read(ctx.cx).content_mode(ctx.window, ctx.cx);
+
+        let visible_bounds = ctx.window.content_mask().bounds;
+        let intersection = visible_bounds.intersect(&bounds);
+
+        let (rects, batched_text_runs) = if intersection.size.height <= px(0.)
+            || intersection.size.width <= px(0.)
+        {
+            (Vec::new(), Vec::new())
+        } else if intersection == bounds {
+            TerminalElement::layout_grid(
+                cells.iter().cloned(),
+                0,
+                &text_style,
+                last_hovered_word
+                    .as_ref()
+                    .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                minimum_contrast,
+                ctx.cx,
+            )
+        } else {
+            let rows_above_viewport =
+                f32::from((intersection.top() - bounds.top()).max(px(0.)) / line_height_px)
+                    as usize;
+            let visible_row_count =
+                f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
+
+            TerminalElement::layout_grid(
+                cells
+                    .iter()
+                    .chunk_by(|c| c.point.line)
+                    .into_iter()
+                    .skip(rows_above_viewport)
+                    .take(visible_row_count)
+                    .flat_map(|(_, line_cells)| line_cells)
+                    .cloned(),
+                rows_above_viewport as i32,
+                &text_style,
+                last_hovered_word
+                    .as_ref()
+                    .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                minimum_contrast,
+                ctx.cx,
+            )
+        };
+
+        // Layout cursor
+        let cursor_point = DisplayCursor::from(cursor.point, display_offset);
+        let cursor_text = {
+            let str_trxt = cursor_char.to_string();
+            let len = str_trxt.len();
+            ctx.window.text_system().shape_line(
+                str_trxt.into(),
+                text_style.font_size.to_pixels(ctx.window.rem_size()),
+                &[TextRun {
+                    len,
+                    font: text_style.font(),
+                    color: theme.colors().terminal_ansi_background,
+                    ..Default::default()
+                }],
+                None,
+            )
+        };
+
+        let ime_cursor_bounds =
+            TerminalElement::shape_cursor(cursor_point, dimensions, &cursor_text).map(
+                |(cursor_position, block_width)| Bounds {
+                    origin: cursor_position,
+                    size: size(block_width, dimensions.line_height),
+                },
+            );
+
+        let cursor_layout = if let AlacCursorShape::Hidden = cursor.shape {
+            None
+        } else {
+            let focused = self.focused;
+            ime_cursor_bounds.map(move |cursor_bounds| {
+                let (shape, text) = match cursor.shape {
+                    AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
+                    AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
+                    AlacCursorShape::Underline => (CursorShape::Underline, None),
+                    AlacCursorShape::Beam => (CursorShape::Bar, None),
+                    AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
+                    AlacCursorShape::Hidden => unreachable!(),
+                };
+
+                CursorLayout::new(
+                    cursor_bounds.origin,
+                    cursor_bounds.size.width,
+                    cursor_bounds.size.height,
+                    theme.players().local().cursor,
+                    shape,
+                    text,
+                )
+            })
+        };
+
+        // Prepare block below cursor element for ConditionalSlot
+        if let Some(block) = &self.block_below_cursor {
+            let terminal = self.terminal.read(ctx.cx);
+            if terminal.last_content.display_offset == 0 {
+                let target_line = terminal.last_content.cursor.point.line.0 + 1;
+                let render = &block.render;
+                let mut block_cx = BlockContext {
+                    window: ctx.window,
+                    context: ctx.cx,
+                    dimensions,
+                };
+                let element = render(&mut block_cx);
+
+                let available_width = dimensions.width() + gutter;
+                let available_height = block.height as f32 * dimensions.line_height();
+                let origin = bounds.origin
+                    + point(px(0.), target_line as f32 * dimensions.line_height())
+                    - point(px(0.), scroll_top);
+
+                self.block_origin = origin;
+                self.block_size = size(available_width, available_height);
+                self.pending_block = Some(element);
+            }
+        }
+
+        self.layout = Some(LayoutState {
+            hitbox,
+            batched_text_runs,
+            cursor: cursor_layout,
+            ime_cursor_bounds,
+            background_color,
+            dimensions,
+            rects,
+            relative_highlighted_ranges,
+            mode,
+            display_offset,
+            gutter,
+            base_text_style: text_style,
+            content_mode,
+        });
+
+        PrepaintFrame {
+            handled: true,
+            pushed_content_mask: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_end(&mut self, _ctx: &mut PrepaintCtx, _frame: PrepaintFrame) {}
+
+    #[allow(deprecated)]
+    fn paint_begin(&mut self, ctx: &mut PaintCtx) -> PaintFrame {
+        let Some(layout) = self.layout.as_ref() else {
+            return PaintFrame::default();
+        };
+
+        let paint_start = Instant::now();
+        let bounds = self.bounds;
+        let scroll_top = self.scroll_top;
+
+        ctx.push_content_mask(ContentMask { bounds });
+
+        ctx.window.paint_quad(fill(bounds, layout.background_color));
+        let origin =
+            bounds.origin + Point::new(layout.gutter, px(0.)) - Point::new(px(0.), scroll_top);
+
+        let marked_text_cloned: Option<String> = {
+            let ime_state = &self.terminal_view.read(ctx.cx).ime_state;
+            ime_state.as_ref().map(|state| state.marked_text.clone())
+        };
+
+        let terminal_input_handler = TerminalInputHandler {
+            terminal: self.terminal.clone(),
+            terminal_view: self.terminal_view.clone(),
+            cursor_bounds: layout.ime_cursor_bounds.map(|b| b + origin),
+            workspace: self.workspace.clone(),
+        };
+
+        // Extract values needed for register_mouse_listeners before borrowing self
+        let mode = layout.mode;
+        let hitbox = layout.hitbox.clone();
+        let content_mode = layout.content_mode.clone();
+
+        // Register mouse listeners
+        self.register_mouse_listeners(mode, &hitbox, &content_mode, ctx.window);
+
+        let layout = self.layout.as_mut().expect("layout should exist");
+
+        if ctx.window.modifiers().secondary()
+            && bounds.contains(&ctx.window.mouse_position())
+            && self.terminal_view.read(ctx.cx).hover.is_some()
+        {
+            ctx.window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
+        } else {
+            ctx.window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
+        }
+
+        ctx.window.handle_input(&self.focus, terminal_input_handler, ctx.cx);
+
+        ctx.window.on_key_event({
+            let terminal = self.terminal.clone();
+            move |event: &ModifiersChangedEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+
+                terminal.update(cx, |term, cx| {
+                    term.try_modifiers_change(&event.modifiers, window, cx)
+                });
+            }
+        });
+
+        for rect in &layout.rects {
+            rect.paint(origin, &layout.dimensions, ctx.window);
+        }
+
+        for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
+            if let Some((start_y, highlighted_range_lines)) =
+                to_highlighted_range_lines(relative_highlighted_range, layout, origin)
+            {
+                let corner_radius = if EditorSettings::get_global(ctx.cx).rounded_selection
+                {
+                    0.15 * layout.dimensions.line_height
+                } else {
+                    Pixels::ZERO
+                };
+                let hr = HighlightedRange {
+                    start_y,
+                    line_height: layout.dimensions.line_height,
+                    lines: highlighted_range_lines,
+                    color: *color,
+                    corner_radius: corner_radius,
+                };
+                hr.paint(true, bounds, ctx.window);
+            }
+        }
+
+        // Paint batched text runs
+        let text_paint_start = Instant::now();
+        for batch in &layout.batched_text_runs {
+            batch.paint(origin, &layout.dimensions, ctx.window, ctx.cx);
+        }
+        let text_paint_time = text_paint_start.elapsed();
+
+        if let Some(text_to_mark) = &marked_text_cloned
+            && !text_to_mark.is_empty()
+            && let Some(ime_bounds) = layout.ime_cursor_bounds
+        {
+            let ime_position = (ime_bounds + origin).origin;
+            let mut ime_style = layout.base_text_style.clone();
+            ime_style.underline = Some(UnderlineStyle {
+                color: Some(ime_style.color),
+                thickness: px(1.0),
+                wavy: false,
+            });
+
+            let shaped_line = ctx.window.text_system().shape_line(
+                text_to_mark.clone().into(),
+                ime_style.font_size.to_pixels(ctx.window.rem_size()),
+                &[TextRun {
+                    len: text_to_mark.len(),
+                    font: ime_style.font(),
+                    color: ime_style.color,
+                    underline: ime_style.underline,
+                    ..Default::default()
+                }],
+                None,
+            );
+
+            // Paint background to cover terminal text behind marked text
+            let ime_background_bounds = Bounds::new(
+                ime_position,
+                size(shaped_line.width, layout.dimensions.line_height),
+            );
+            ctx.window.paint_quad(fill(ime_background_bounds, layout.background_color));
+
+            shaped_line
+                .paint(
+                    ime_position,
+                    layout.dimensions.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    ctx.window,
+                    ctx.cx,
+                )
+                .log_err();
+        }
+
+        let cursor = layout.cursor.take();
+        if self.cursor_visible
+            && marked_text_cloned.is_none()
+            && let Some(mut cursor) = cursor
+        {
+            cursor.paint(origin, ctx.window, ctx.cx);
+        }
+
+        log::debug!(
+            "Terminal paint: {} text runs, {} rects, \
+            text paint took {:?}, total paint took {total_paint_time:?}",
+            layout.batched_text_runs.len(),
+            layout.rects.len(),
+            text_paint_time,
+            total_paint_time = paint_start.elapsed()
+        );
+
+        PaintFrame {
+            handled: true,
+            pushed_content_mask: true,
+            ..Default::default()
+        }
+    }
+
+    fn paint_end(&mut self, _ctx: &mut PaintCtx, _frame: PaintFrame) {}
+
+    fn interactivity(&self) -> Option<&Interactivity> {
+        Some(&self.interactivity)
+    }
+}
+
+impl TerminalNode {
+    #[allow(deprecated)]
     fn register_mouse_listeners(
         &mut self,
         mode: TermMode,
@@ -687,7 +1319,7 @@ impl TerminalElement {
             let terminal = self.terminal.clone();
             let hitbox = hitbox.clone();
             let focus = focus.clone();
-            let terminal_view = terminal_view;
+            let terminal_view = terminal_view.clone();
             move |e: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
@@ -728,685 +1360,120 @@ impl TerminalElement {
                 },
             ),
         );
+
         self.interactivity.on_mouse_down(
             MouseButton::Middle,
             TerminalElement::generic_button_handler(
                 terminal.clone(),
                 focus.clone(),
-                true,
+                false,
                 move |terminal, e, cx| {
                     terminal.mouse_down(e, cx);
                 },
             ),
         );
 
-        if content_mode.is_scrollable() {
-            self.interactivity.on_scroll_wheel({
-                let terminal_view = self.terminal_view.downgrade();
-                move |e, window, cx| {
-                    terminal_view
-                        .update(cx, |terminal_view, cx| {
-                            if matches!(terminal_view.mode, TerminalMode::Standalone)
-                                || terminal_view.focus_handle.is_focused(window)
-                            {
-                                terminal_view.scroll_wheel(e, cx);
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                }
-            });
-        }
+        self.interactivity.on_mouse_up(
+            MouseButton::Middle,
+            TerminalElement::generic_button_handler(
+                terminal.clone(),
+                focus.clone(),
+                false,
+                move |terminal, e, cx| {
+                    terminal.mouse_up(e, cx);
+                },
+            ),
+        );
 
-        // Mouse mode handlers:
-        // All mouse modes need the extra click handlers
-        if mode.intersects(TermMode::MOUSE_MODE) {
-            self.interactivity.on_mouse_down(
-                MouseButton::Right,
-                TerminalElement::generic_button_handler(
-                    terminal.clone(),
-                    focus.clone(),
-                    true,
-                    move |terminal, e, cx| {
-                        terminal.mouse_down(e, cx);
-                    },
-                ),
-            );
-            self.interactivity.on_mouse_up(
-                MouseButton::Right,
-                TerminalElement::generic_button_handler(
-                    terminal.clone(),
-                    focus.clone(),
-                    false,
-                    move |terminal, e, cx| {
-                        terminal.mouse_up(e, cx);
-                    },
-                ),
-            );
-            self.interactivity.on_mouse_up(
-                MouseButton::Middle,
-                TerminalElement::generic_button_handler(
-                    terminal,
-                    focus,
-                    false,
-                    move |terminal, e, cx| {
-                        terminal.mouse_up(e, cx);
-                    },
-                ),
-            );
-        }
-    }
+        self.interactivity.on_mouse_down(
+            MouseButton::Right,
+            TerminalElement::generic_button_handler(
+                terminal.clone(),
+                focus.clone(),
+                false,
+                move |terminal, e, cx| {
+                    terminal.mouse_down(e, cx);
+                },
+            ),
+        );
 
-    fn rem_size(&self, cx: &mut App) -> Option<Pixels> {
-        let settings = ThemeSettings::get_global(cx).clone();
-        let buffer_font_size = settings.buffer_font_size(cx);
-        let rem_size_scale = {
-            // Our default UI font size is 14px on a 16px base scale.
-            // This means the default UI font size is 0.875rems.
-            let default_font_size_scale = 14. / ui::BASE_REM_SIZE_IN_PX;
+        self.interactivity.on_mouse_up(
+            MouseButton::Right,
+            TerminalElement::generic_button_handler(
+                terminal.clone(),
+                focus.clone(),
+                false,
+                move |terminal, e, cx| {
+                    terminal.mouse_up(e, cx);
+                },
+            ),
+        );
 
-            // We then determine the delta between a single rem and the default font
-            // size scale.
-            let default_font_size_delta = 1. - default_font_size_scale;
+        self.interactivity.on_scroll_wheel({
+            let terminal = terminal.clone();
+            let terminal_view = terminal_view.clone();
+            let content_mode = content_mode.clone();
+            move |e, _window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    let line_height = terminal.last_content().terminal_bounds.line_height;
+                    let y_delta = e.delta.pixel_delta(line_height).y;
+                    let should_scroll = match &content_mode {
+                        ContentMode::Inline { .. } => true,
+                        ContentMode::Scrollable => {
+                            !mode.contains(TermMode::ALT_SCREEN)
+                                || terminal.scrolled_to_top() && y_delta > Pixels::ZERO
+                                || terminal.scrolled_to_bottom() && y_delta < Pixels::ZERO
+                        }
+                    };
 
-            // Finally, we add this delta to 1rem to get the scale factor that
-            // should be used to scale up the UI.
-            1. + default_font_size_delta
-        };
-
-        Some(buffer_font_size * rem_size_scale)
+                    if should_scroll {
+                        terminal_view.update(cx, |view, cx| {
+                            view.scroll_wheel(e, cx);
+                        });
+                    } else {
+                        let scroll_multiplier =
+                            TerminalSettings::get_global(cx).scroll_multiplier.max(0.01);
+                        terminal.scroll_wheel(e, scroll_multiplier);
+                    }
+                    cx.notify();
+                })
+            }
+        });
     }
 }
 
-impl Element for TerminalElement {
-    type RequestLayoutState = ();
-    type PrepaintState = LayoutState;
-
+impl ElementImpl for TerminalElement {
     fn id(&self) -> Option<ElementId> {
         self.interactivity.element_id.clone()
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        Some(Box::new(TerminalNode::new(self)))
     }
 
-    fn request_layout(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let height: Length = match self.terminal_view.read(cx).content_mode(window, cx) {
-            ContentMode::Inline {
-                displayed_lines,
-                total_lines: _,
-            } => {
-                let rem_size = window.rem_size();
-                let line_height = f32::from(window.text_style().font_size.to_pixels(rem_size))
-                    * TerminalSettings::get_global(cx).line_height.value();
-                px(displayed_lines as f32 * line_height).into()
-            }
-            ContentMode::Scrollable => {
-                if let TerminalMode::Embedded { .. } = &self.mode {
-                    let term = self.terminal.read(cx);
-                    if !term.scrolled_to_top() && !term.scrolled_to_bottom() && self.focused {
-                        self.interactivity.occlude_mouse();
-                    }
-                }
-
-                relative(1.).into()
-            }
-        };
-
-        let layout_id = self.interactivity.request_layout(
-            global_id,
-            inspector_id,
-            window,
-            cx,
-            |mut style, window, cx| {
-                style.size.width = relative(1.).into();
-                style.size.height = height;
-
-                window.request_layout(style, None, cx)
-            },
-        );
-        (layout_id, ())
+    fn render_node_type_id(&self) -> Option<std::any::TypeId> {
+        Some(std::any::TypeId::of::<TerminalNode>())
     }
 
-    fn prepaint(
+    fn update_render_node(
         &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let rem_size = self.rem_size(cx);
-        self.interactivity.prepaint(
-            global_id,
-            inspector_id,
-            bounds,
-            bounds.size,
-            window,
-            cx,
-            |_, _, hitbox, window, cx| {
-                let hitbox = hitbox.unwrap();
-                let settings = ThemeSettings::get_global(cx).clone();
+        node: &mut dyn RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        let node = node.as_any_mut().downcast_mut::<TerminalNode>()?;
 
-                let buffer_font_size = settings.buffer_font_size(cx);
+        node.terminal = self.terminal.clone();
+        node.terminal_view = self.terminal_view.clone();
+        node.workspace = self.workspace.clone();
+        node.focus = self.focus.clone();
+        node.focused = self.focused;
+        node.cursor_visible = self.cursor_visible;
+        node.mode = self.mode.clone();
+        node.block_below_cursor = self.block_below_cursor.take();
+        std::mem::swap(&mut node.interactivity, &mut self.interactivity);
 
-                let terminal_settings = TerminalSettings::get_global(cx);
-                let minimum_contrast = terminal_settings.minimum_contrast;
-
-                let font_family = terminal_settings.font_family.as_ref().map_or_else(
-                    || settings.buffer_font.family.clone(),
-                    |font_family| font_family.0.clone().into(),
-                );
-
-                let font_fallbacks = terminal_settings
-                    .font_fallbacks
-                    .as_ref()
-                    .or(settings.buffer_font.fallbacks.as_ref())
-                    .cloned();
-
-                let font_features = terminal_settings
-                    .font_features
-                    .as_ref()
-                    .unwrap_or(&FontFeatures::disable_ligatures())
-                    .clone();
-
-                let font_weight = terminal_settings.font_weight.unwrap_or_default();
-
-                let line_height = terminal_settings.line_height.value();
-
-                let font_size = match &self.mode {
-                    TerminalMode::Embedded { .. } => {
-                        window.text_style().font_size.to_pixels(window.rem_size())
-                    }
-                    TerminalMode::Standalone => terminal_settings
-                        .font_size
-                        .map_or(buffer_font_size, |size| theme::adjusted_font_size(size, cx)),
-                };
-
-                let theme = cx.theme().clone();
-
-                let link_style = HighlightStyle {
-                    color: Some(theme.colors().link_text_hover),
-                    font_weight: Some(font_weight),
-                    font_style: None,
-                    background_color: None,
-                    underline: Some(UnderlineStyle {
-                        thickness: px(1.0),
-                        color: Some(theme.colors().link_text_hover),
-                        wavy: false,
-                    }),
-                    strikethrough: None,
-                    fade_out: None,
-                };
-
-                let text_style = TextStyle {
-                    font_family,
-                    font_features,
-                    font_weight,
-                    font_fallbacks,
-                    font_size: font_size.into(),
-                    font_style: FontStyle::Normal,
-                    line_height: px(line_height).into(),
-                    background_color: Some(theme.colors().terminal_ansi_background),
-                    white_space: WhiteSpace::Normal,
-                    // These are going to be overridden per-cell
-                    color: theme.colors().terminal_foreground,
-                    ..Default::default()
-                };
-
-                let text_system = cx.text_system();
-                let player_color = theme.players().local();
-                let match_color = theme.colors().search_match_background;
-                let gutter;
-                let (dimensions, line_height_px) = {
-                    let rem_size = window.rem_size();
-                    let font_pixels = text_style.font_size.to_pixels(rem_size);
-                    let line_height = f32::from(font_pixels) * line_height;
-                    let font_id = cx.text_system().resolve_font(&text_style.font());
-
-                    let cell_width = text_system
-                        .advance(font_id, font_pixels, 'm')
-                        .unwrap()
-                        .width;
-                    gutter = cell_width;
-
-                    let mut size = bounds.size;
-                    size.width -= gutter;
-
-                    // https://github.com/zed-industries/zed/issues/2750
-                    // if the terminal is one column wide, rendering 🦀
-                    // causes alacritty to misbehave.
-                    if size.width < cell_width * 2.0 {
-                        size.width = cell_width * 2.0;
-                    }
-
-                    let mut origin = bounds.origin;
-                    origin.x += gutter;
-
-                    (
-                        TerminalBounds::new(px(line_height), cell_width, Bounds { origin, size }),
-                        line_height,
-                    )
-                };
-
-                let search_matches = self.terminal.read(cx).matches.clone();
-
-                let background_color = theme.colors().terminal_background;
-
-                let (last_hovered_word, hover_tooltip) =
-                    self.terminal.update(cx, |terminal, cx| {
-                        terminal.set_size(dimensions);
-                        terminal.sync(window, cx);
-
-                        if window.modifiers().secondary()
-                            && bounds.contains(&window.mouse_position())
-                            && self.terminal_view.read(cx).hover.is_some()
-                        {
-                            let registered_hover = self.terminal_view.read(cx).hover.as_ref();
-                            if terminal.last_content.last_hovered_word.as_ref()
-                                == registered_hover.map(|hover| &hover.hovered_word)
-                            {
-                                (
-                                    terminal.last_content.last_hovered_word.clone(),
-                                    registered_hover.map(|hover| hover.tooltip.clone()),
-                                )
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            (None, None)
-                        }
-                    });
-
-                let scroll_top = self.terminal_view.read(cx).scroll_top;
-                let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
-                    let offset = bounds.origin + point(gutter, px(0.)) - point(px(0.), scroll_top);
-                    let mut element = div()
-                        .size_full()
-                        .id("terminal-element")
-                        .tooltip(Tooltip::text(hover_tooltip))
-                        .into_any_element();
-                    element.prepaint_as_root(offset, bounds.size.into(), window, cx);
-                    element
-                });
-
-                let TerminalContent {
-                    cells,
-                    mode,
-                    display_offset,
-                    cursor_char,
-                    selection,
-                    cursor,
-                    ..
-                } = &self.terminal.read(cx).last_content;
-                let mode = *mode;
-                let display_offset = *display_offset;
-
-                // searches, highlights to a single range representations
-                let mut relative_highlighted_ranges = Vec::new();
-                for search_match in search_matches {
-                    relative_highlighted_ranges.push((search_match, match_color))
-                }
-                if let Some(selection) = selection {
-                    relative_highlighted_ranges
-                        .push((selection.start..=selection.end, player_color.selection));
-                }
-
-                // then have that representation be converted to the appropriate highlight data structure
-
-                let content_mode = self.terminal_view.read(cx).content_mode(window, cx);
-
-                // Calculate the intersection of the terminal's bounds with the current
-                // content mask (the visible viewport after all parent clipping).
-                // This allows us to only render cells that are actually visible, which is
-                // critical for performance when terminals are inside scrollable containers
-                // like the Agent Panel thread view.
-                //
-                // This optimization is analogous to the editor optimization in PR #45077
-                // which fixed performance issues with large AutoHeight editors inside Lists.
-                let visible_bounds = window.content_mask().bounds;
-                let intersection = visible_bounds.intersect(&bounds);
-
-                // If the terminal is entirely outside the viewport, skip all cell processing.
-                // This handles the case where the terminal has been scrolled past (above or
-                // below the viewport), similar to the editor fix in PR #45077 where start_row
-                // could exceed max_row when the editor was positioned above the viewport.
-                let (rects, batched_text_runs) = if intersection.size.height <= px(0.)
-                    || intersection.size.width <= px(0.)
-                {
-                    (Vec::new(), Vec::new())
-                } else if intersection == bounds {
-                    // Fast path: terminal fully visible, no clipping needed.
-                    // Avoid grouping/allocation overhead by streaming cells directly.
-                    TerminalElement::layout_grid(
-                        cells.iter().cloned(),
-                        0,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
-                } else {
-                    // Calculate which screen rows are visible based on pixel positions.
-                    // This works for both Scrollable and Inline modes because we filter
-                    // by screen position (enumerated line group index), not by the cell's
-                    // internal line number (which can be negative in Scrollable mode for
-                    // scrollback history).
-                    let rows_above_viewport =
-                        f32::from((intersection.top() - bounds.top()).max(px(0.)) / line_height_px)
-                            as usize;
-                    let visible_row_count =
-                        f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
-
-                    TerminalElement::layout_grid(
-                        // Group cells by line and filter to only the visible screen rows.
-                        // skip() and take() work on enumerated line groups (screen position),
-                        // making this work regardless of the actual cell.point.line values.
-                        cells
-                            .iter()
-                            .chunk_by(|c| c.point.line)
-                            .into_iter()
-                            .skip(rows_above_viewport)
-                            .take(visible_row_count)
-                            .flat_map(|(_, line_cells)| line_cells)
-                            .cloned(),
-                        rows_above_viewport as i32,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
-                };
-
-                // Layout cursor. Rectangle is used for IME, so we should lay it out even
-                // if we don't end up showing it.
-                let cursor_point = DisplayCursor::from(cursor.point, display_offset);
-                let cursor_text = {
-                    let str_trxt = cursor_char.to_string();
-                    let len = str_trxt.len();
-                    window.text_system().shape_line(
-                        str_trxt.into(),
-                        text_style.font_size.to_pixels(window.rem_size()),
-                        &[TextRun {
-                            len,
-                            font: text_style.font(),
-                            color: theme.colors().terminal_ansi_background,
-                            ..Default::default()
-                        }],
-                        None,
-                    )
-                };
-
-                let ime_cursor_bounds =
-                    TerminalElement::shape_cursor(cursor_point, dimensions, &cursor_text).map(
-                        |(cursor_position, block_width)| Bounds {
-                            origin: cursor_position,
-                            size: size(block_width, dimensions.line_height),
-                        },
-                    );
-
-                let cursor = if let AlacCursorShape::Hidden = cursor.shape {
-                    None
-                } else {
-                    let focused = self.focused;
-                    ime_cursor_bounds.map(move |bounds| {
-                        let (shape, text) = match cursor.shape {
-                            AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
-                            AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
-                            AlacCursorShape::Underline => (CursorShape::Underline, None),
-                            AlacCursorShape::Beam => (CursorShape::Bar, None),
-                            AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
-                            AlacCursorShape::Hidden => unreachable!(),
-                        };
-
-                        CursorLayout::new(
-                            bounds.origin,
-                            bounds.size.width,
-                            bounds.size.height,
-                            theme.players().local().cursor,
-                            shape,
-                            text,
-                        )
-                    })
-                };
-
-                let block_below_cursor_element = if let Some(block) = &self.block_below_cursor {
-                    let terminal = self.terminal.read(cx);
-                    if terminal.last_content.display_offset == 0 {
-                        let target_line = terminal.last_content.cursor.point.line.0 + 1;
-                        let render = &block.render;
-                        let mut block_cx = BlockContext {
-                            window,
-                            context: cx,
-                            dimensions,
-                        };
-                        let element = render(&mut block_cx);
-                        let mut element = div().occlude().child(element).into_any_element();
-                        let available_space = size(
-                            AvailableSpace::Definite(dimensions.width() + gutter),
-                            AvailableSpace::Definite(
-                                block.height as f32 * dimensions.line_height(),
-                            ),
-                        );
-                        let origin = bounds.origin
-                            + point(px(0.), target_line as f32 * dimensions.line_height())
-                            - point(px(0.), scroll_top);
-                        window.with_rem_size(rem_size, |window| {
-                            element.prepaint_as_root(origin, available_space, window, cx);
-                        });
-                        Some(element)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                LayoutState {
-                    hitbox,
-                    batched_text_runs,
-                    cursor,
-                    ime_cursor_bounds,
-                    background_color,
-                    dimensions,
-                    rects,
-                    relative_highlighted_ranges,
-                    mode,
-                    display_offset,
-                    hyperlink_tooltip,
-                    gutter,
-                    block_below_cursor_element,
-                    base_text_style: text_style,
-                    content_mode,
-                }
-            },
-        )
-    }
-
-    fn paint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        layout: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let paint_start = Instant::now();
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            let scroll_top = self.terminal_view.read(cx).scroll_top;
-
-            window.paint_quad(fill(bounds, layout.background_color));
-            let origin =
-                bounds.origin + Point::new(layout.gutter, px(0.)) - Point::new(px(0.), scroll_top);
-
-            let marked_text_cloned: Option<String> = {
-                let ime_state = &self.terminal_view.read(cx).ime_state;
-                ime_state.as_ref().map(|state| state.marked_text.clone())
-            };
-
-            let terminal_input_handler = TerminalInputHandler {
-                terminal: self.terminal.clone(),
-                terminal_view: self.terminal_view.clone(),
-                cursor_bounds: layout.ime_cursor_bounds.map(|bounds| bounds + origin),
-                workspace: self.workspace.clone(),
-            };
-
-            self.register_mouse_listeners(
-                layout.mode,
-                &layout.hitbox,
-                &layout.content_mode,
-                window,
-            );
-            if window.modifiers().secondary()
-                && bounds.contains(&window.mouse_position())
-                && self.terminal_view.read(cx).hover.is_some()
-            {
-                window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
-            } else {
-                window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
-            }
-
-            let original_cursor = layout.cursor.take();
-            let hyperlink_tooltip = layout.hyperlink_tooltip.take();
-            let block_below_cursor_element = layout.block_below_cursor_element.take();
-            self.interactivity.paint(
-                global_id,
-                inspector_id,
-                bounds,
-                Some(&layout.hitbox),
-                window,
-                cx,
-                |_, window, cx| {
-                    window.handle_input(&self.focus, terminal_input_handler, cx);
-
-                    window.on_key_event({
-                        let this = self.terminal.clone();
-                        move |event: &ModifiersChangedEvent, phase, window, cx| {
-                            if phase != DispatchPhase::Bubble {
-                                return;
-                            }
-
-                            this.update(cx, |term, cx| {
-                                term.try_modifiers_change(&event.modifiers, window, cx)
-                            });
-                        }
-                    });
-
-                    for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, window);
-                    }
-
-                    for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
-                        if let Some((start_y, highlighted_range_lines)) =
-                            to_highlighted_range_lines(relative_highlighted_range, layout, origin)
-                        {
-                            let corner_radius = if EditorSettings::get_global(cx).rounded_selection
-                            {
-                                0.15 * layout.dimensions.line_height
-                            } else {
-                                Pixels::ZERO
-                            };
-                            let hr = HighlightedRange {
-                                start_y,
-                                line_height: layout.dimensions.line_height,
-                                lines: highlighted_range_lines,
-                                color: *color,
-                                corner_radius: corner_radius,
-                            };
-                            hr.paint(true, bounds, window);
-                        }
-                    }
-
-                    // Paint batched text runs instead of individual cells
-                    let text_paint_start = Instant::now();
-                    for batch in &layout.batched_text_runs {
-                        batch.paint(origin, &layout.dimensions, window, cx);
-                    }
-                    let text_paint_time = text_paint_start.elapsed();
-
-                    if let Some(text_to_mark) = &marked_text_cloned
-                        && !text_to_mark.is_empty()
-                        && let Some(ime_bounds) = layout.ime_cursor_bounds
-                    {
-                        let ime_position = (ime_bounds + origin).origin;
-                        let mut ime_style = layout.base_text_style.clone();
-                        ime_style.underline = Some(UnderlineStyle {
-                            color: Some(ime_style.color),
-                            thickness: px(1.0),
-                            wavy: false,
-                        });
-
-                        let shaped_line = window.text_system().shape_line(
-                            text_to_mark.clone().into(),
-                            ime_style.font_size.to_pixels(window.rem_size()),
-                            &[TextRun {
-                                len: text_to_mark.len(),
-                                font: ime_style.font(),
-                                color: ime_style.color,
-                                underline: ime_style.underline,
-                                ..Default::default()
-                            }],
-                            None,
-                        );
-
-                        // Paint background to cover terminal text behind marked text
-                        let ime_background_bounds = Bounds::new(
-                            ime_position,
-                            size(shaped_line.width, layout.dimensions.line_height),
-                        );
-                        window.paint_quad(fill(ime_background_bounds, layout.background_color));
-
-                        shaped_line
-                            .paint(
-                                ime_position,
-                                layout.dimensions.line_height,
-                                gpui::TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            )
-                            .log_err();
-                    }
-
-                    if self.cursor_visible
-                        && marked_text_cloned.is_none()
-                        && let Some(mut cursor) = original_cursor
-                    {
-                        cursor.paint(origin, window, cx);
-                    }
-
-                    if let Some(mut element) = block_below_cursor_element {
-                        element.paint(window, cx);
-                    }
-
-                    if let Some(mut element) = hyperlink_tooltip {
-                        element.paint(window, cx);
-                    }
-
-                    log::debug!(
-                        "Terminal paint: {} text runs, {} rects, \
-                        text paint took {:?}, total paint took {total_paint_time:?}",
-                        layout.batched_text_runs.len(),
-                        layout.rects.len(),
-                        text_paint_time,
-                        total_paint_time = paint_start.elapsed()
-                    );
-                },
-            );
-        });
+        Some(UpdateResult::LAYOUT_CHANGED)
     }
 }
 

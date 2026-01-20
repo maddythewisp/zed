@@ -4,7 +4,7 @@ use futures::StreamExt;
 use gpui::{
     AppContext as _, AsyncApp, Bounds, Context, Entity, InteractiveElement, KeyBinding, Menu,
     MenuItem, ParentElement, Pixels, Render, ScreenCaptureStream, SharedString,
-    StatefulInteractiveElement as _, Styled, Task, Window, WindowBounds, WindowHandle,
+    Styled, Task, Window, WindowBounds, WindowHandle,
     WindowOptions, actions, bounds, div, point,
     prelude::{FluentBuilder as _, IntoElement},
     px, rgb, size,

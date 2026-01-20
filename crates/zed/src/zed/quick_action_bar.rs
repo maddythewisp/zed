@@ -13,7 +13,7 @@ use editor::{Editor, EditorSettings};
 use gpui::{
     Action, AnchoredPositionMode, ClickEvent, Context, Corner, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement, ParentElement, Render, Styled, Subscription,
-    WeakEntity, Window, anchored, deferred, point,
+    WeakEntity, Window, anchored, point,
 };
 use project::{DisableAiSettings, project_settings::DiagnosticSeverity};
 use search::{BufferSearchBar, buffer_search};
@@ -220,13 +220,12 @@ impl Render for QuickActionBar {
                         }),
                 )
                 .children(code_action_element.map(|menu| {
-                    deferred(
-                        anchored()
-                            .position_mode(AnchoredPositionMode::Local)
-                            .position(point(px(20.), px(20.)))
-                            .anchor(Corner::TopRight)
-                            .child(menu),
-                    )
+                    anchored()
+                        .position_mode(AnchoredPositionMode::Local)
+                        .position(point(px(20.), px(20.)))
+                        .anchor(Corner::TopRight)
+                        .child(menu)
+                        .z_index(0)
                 }))
         });
 

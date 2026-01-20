@@ -29,6 +29,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
 }
 
 #[derive(Clone)]
@@ -74,6 +75,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            request_frame_callback: None,
         })))
     }
 
@@ -108,6 +110,17 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn simulate_frame(&self) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.request_frame_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(Default::default());
+        self.0.lock().request_frame_callback = Some(callback);
     }
 }
 
@@ -240,7 +253,9 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
-    fn on_request_frame(&self, _callback: Box<dyn FnMut(RequestFrameOptions)>) {}
+    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+        self.0.lock().request_frame_callback = Some(callback);
+    }
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
@@ -274,7 +289,7 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, _scene: &crate::Scene) {}
+    fn draw(&self, _scene: &crate::Scene, _segment_pool: &crate::SceneSegmentPool) {}
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()

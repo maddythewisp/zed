@@ -1,8 +1,8 @@
 use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll, styled_runs_for_code_label};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, HighlightStyle, ParentElement, StyledText, Task, TextStyle,
-    WeakEntity, Window, relative, rems,
+    App, Context, DismissEvent, Entity, HighlightStyle, ParentElement, Task, TextElement,
+    TextStyle, WeakEntity, Window, relative, rems,
 };
 use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate};
@@ -290,7 +290,7 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                 .child(
                     v_flex()
                         .child(LabelLike::new().child(
-                            StyledText::new(label).with_default_highlights(&text_style, highlights),
+                            label.with_default_highlights(&text_style, highlights),
                         ))
                         .child(
                             h_flex()

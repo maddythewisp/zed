@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use gpui::{
     AnyElement, AsyncWindowContext, Context, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TextStyleRefinement,
+    StyleRefinement, Styled, Subscription, Task, TextStyleRefinement,
     Window, div, px,
 };
 use itertools::Itertools;
@@ -789,7 +789,7 @@ impl HoverState {
         text_layout_details: &TextLayoutDetails,
         window: &mut Window,
         cx: &mut Context<Editor>,
-    ) -> Option<(DisplayPoint, Vec<AnyElement>)> {
+    ) -> Option<(DisplayPoint, Vec<(AnyElement, Size<Pixels>)>)> {
         if !self.visible() {
             return None;
         }
@@ -844,13 +844,33 @@ impl HoverState {
             return None;
         }
 
-        let mut elements = Vec::new();
+        let mut elements: Vec<(AnyElement, Size<Pixels>)> = Vec::new();
 
         if let Some(diagnostic_popover) = self.diagnostic_popover.as_ref() {
-            elements.push(diagnostic_popover.render(max_size, window, cx));
+            let element = diagnostic_popover.render(max_size, window, cx);
+            let default_size =
+                gpui::size(gpui::rems(32.).to_pixels(window.rem_size()), gpui::rems(16.).to_pixels(window.rem_size()));
+            let measurement_key = gpui::MeasurementKey::for_callsite(0);
+            let (element, size) = window.with_cached_measurement_keyed(
+                measurement_key,
+                element,
+                gpui::AvailableSpace::min_size(),
+                default_size,
+            );
+            elements.push((element, size));
         }
-        for info_popover in &mut self.info_popovers {
-            elements.push(info_popover.render(max_size, window, cx));
+        for (ix, info_popover) in self.info_popovers.iter_mut().enumerate() {
+            let element = info_popover.render(max_size, window, cx);
+            let default_size =
+                gpui::size(gpui::rems(32.).to_pixels(window.rem_size()), gpui::rems(16.).to_pixels(window.rem_size()));
+            let measurement_key = gpui::MeasurementKey::for_callsite(ix as u64);
+            let (element, size) = window.with_cached_measurement_keyed(
+                measurement_key,
+                element,
+                gpui::AvailableSpace::min_size(),
+                default_size,
+            );
+            elements.push((element, size));
         }
 
         Some((point, elements))

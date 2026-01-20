@@ -7,7 +7,7 @@ use std::{
 
 use gpui::{
     App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement,
-    ParentElement as _, Render, SerializedTaskTiming, SharedString, StatefulInteractiveElement,
+    ParentElement as _, Render, SerializedTaskTiming, SharedString,
     Styled, Task, TaskTiming, TitlebarOptions, UniformListScrollHandle, WindowBounds, WindowHandle,
     WindowOptions, div, prelude::FluentBuilder, px, relative, size, uniform_list,
 };

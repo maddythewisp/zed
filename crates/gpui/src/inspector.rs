@@ -39,7 +39,7 @@ mod conditional {
     impl Clone for InspectorElementPath {
         fn clone(&self) -> Self {
             Self {
-                global_id: self.global_id.clone(),
+                global_id: self.global_id,
                 source_location: self.source_location,
             }
         }

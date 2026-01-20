@@ -36,11 +36,11 @@ pub use visual_test_context::*;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
 use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, DispatchPhase,
-    DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding,
-    KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels,
-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
+    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Asset,
+    AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, DispatchPhase, DisplayId,
+    EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext,
+    Keymap, Keystroke, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
     PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
     RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
     Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem, Window, WindowAppearance,
@@ -624,7 +624,6 @@ pub struct App {
     pub(crate) restart_observers: SubscriberSet<(), Handler>,
     pub(crate) restart_path: Option<PathBuf>,
     pub(crate) window_closed_observers: SubscriberSet<(), WindowClosedHandler>,
-    pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
     pub(crate) prompt_builder: Option<PromptBuilder>,
     pub(crate) window_invalidators_by_entity:
@@ -639,9 +638,6 @@ pub struct App {
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     quit_mode: QuitMode,
     quitting: bool,
-    /// Per-App element arena. This isolates element allocations between different
-    /// App instances (important for tests where multiple Apps run concurrently).
-    pub(crate) element_arena: RefCell<Arena>,
 }
 
 impl App {
@@ -707,7 +703,6 @@ impl App {
                 restart_observers: SubscriberSet::new(),
                 restart_path: None,
                 window_closed_observers: SubscriberSet::new(),
-                layout_id_buffer: Default::default(),
                 propagate_event: true,
                 prompt_builder: Some(PromptBuilder::Default),
                 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -719,7 +714,6 @@ impl App {
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
                 name: None,
-                element_arena: RefCell::new(Arena::new(1024 * 1024)),
             }),
         });
 
@@ -1009,16 +1003,17 @@ impl App {
                 Ok(mut window) => {
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
+                    let root_id = root_view.entity_id();
                     cx.window_update_stack.pop();
                     window.root.replace(root_view.into());
+                    window.ensure_view_root_fiber(root_id);
                     window.defer(cx, |window: &mut Window, cx| window.appearance_changed(cx));
 
                     // allow a window to draw at least once before returning
                     // this didn't cause any issues on non windows platforms as it seems we always won the race to on_request_frame
-                    // on windows we quite frequently lose the race and return a window that has never rendered, which leads to a crash
-                    // where DispatchTree::root_node_id asserts on empty nodes
-                    let clear = window.draw(cx);
-                    clear.clear();
+                    // on windows we quite frequently lose the race and return a window that has never rendered, which leads to
+                    // focus/dispatch state being queried before a root fiber exists
+                    window.draw(cx);
 
                     cx.window_handles.insert(id, window.handle);
                     cx.windows.get_mut(id).unwrap().replace(Box::new(window));
@@ -1337,7 +1332,7 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                 {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear())
+                    self.update_window(window, |_, window, cx| window.draw(cx))
                         .unwrap();
                 }
 
@@ -2172,8 +2167,23 @@ impl App {
                     .push_back(Effect::Notify { emitter: entity_id });
             }
         } else {
-            for invalidator in window_invalidators.values() {
-                invalidator.invalidate_view(entity_id, self);
+            for (window_id, invalidator) in &window_invalidators {
+                let marked = if let Some(window) = self
+                    .windows
+                    .get_mut(*window_id)
+                    .and_then(|window| window.as_deref_mut())
+                {
+                    window.mark_view_dirty(entity_id);
+                    true
+                } else {
+                    false
+                };
+
+                if marked {
+                    invalidator.mark_dirty(entity_id, self);
+                } else {
+                    invalidator.invalidate_view(entity_id, self);
+                }
             }
         }
 

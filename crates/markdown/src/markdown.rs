@@ -3,7 +3,6 @@ mod path_range;
 
 use base64::Engine as _;
 use futures::FutureExt as _;
-use gpui::HitboxBehavior;
 use language::LanguageName;
 use log::Level;
 pub use path_range::{LineCol, PathWithRange};
@@ -21,12 +20,15 @@ use std::time::Duration;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle, StyleRefinement, StyledText,
-    Task, TextLayout, TextRun, TextStyle, TextStyleRefinement, actions, img, point, quad,
+    AnyElement, App, BorderStyle, Bounds, CallbackSlot, ClipboardItem, ConditionalSlot,
+    CursorStyle, DispatchPhase, Edges, Entity, ElementImpl, FocusHandle,
+    Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image,
+    ImageFormat, IntoElement, KeyContext, LayoutCtx, LayoutFrame, Length, MouseButton, PaintCtx,
+    PaintFrame, Pixels, Point, PrepaintCtx, PrepaintFrame, RenderNode, ScrollHandle,
+    StrikethroughStyle, StyleRefinement, TaffyStyle, Task, TextElement, TextLayout, TextRun,
+    TextStyle, TextStyleRefinement, UpdateResult, actions, img, point, quad,
 };
+use smallvec::SmallVec;
 use language::{Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
 use parser::{MarkdownEvent, MarkdownTag, MarkdownTagEnd, parse_links_only, parse_markdown};
@@ -146,7 +148,7 @@ pub type CodeBlockRenderFn = Arc<
 >;
 
 pub type CodeBlockTransformFn =
-    Arc<dyn Fn(AnyDiv, Range<usize>, CodeBlockMetadata, &mut Window, &App) -> AnyDiv>;
+    Arc<dyn Fn(Div, Range<usize>, CodeBlockMetadata, &mut Window, &App) -> Div>;
 
 actions!(
     markdown,
@@ -536,59 +538,47 @@ impl ParsedMarkdown {
     }
 }
 
-pub struct MarkdownElement {
-    markdown: Entity<Markdown>,
-    style: MarkdownStyle,
-    code_block_renderer: CodeBlockRenderer,
-    on_url_click: Option<Box<dyn Fn(SharedString, &mut Window, &mut App)>>,
+/// Type for build callback that constructs markdown content during layout.
+type MarkdownBuildFn =
+    dyn FnOnce(&mut Window, &mut App, &GlobalElementId) -> MarkdownBuildResult + 'static;
+
+/// Result from building markdown content in layout phase.
+struct MarkdownBuildResult {
+    element: AnyElement,
+    text: RenderedText,
 }
 
-impl MarkdownElement {
-    pub fn new(markdown: Entity<Markdown>, style: MarkdownStyle) -> Self {
+/// Retained render node for MarkdownElement.
+struct MarkdownNode {
+    markdown: Entity<Markdown>,
+    style: MarkdownStyle,
+    on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
+
+    build_callback: CallbackSlot<MarkdownBuildFn>,
+
+    pending_child: Option<AnyElement>,
+    rendered_text: Option<RenderedText>,
+
+    hitbox: Option<Hitbox>,
+    bounds: Option<Bounds<Pixels>>,
+}
+
+impl MarkdownNode {
+    fn new(
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
+    ) -> Self {
         Self {
             markdown,
             style,
-            code_block_renderer: CodeBlockRenderer::Default {
-                copy_button: true,
-                copy_button_on_hover: false,
-                border: false,
-            },
-            on_url_click: None,
+            on_url_click,
+            build_callback: CallbackSlot::new(),
+            pending_child: None,
+            rendered_text: None,
+            hitbox: None,
+            bounds: None,
         }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn rendered_text(
-        markdown: Entity<Markdown>,
-        cx: &mut gpui::VisualTestContext,
-        style: impl FnOnce(&Window, &App) -> MarkdownStyle,
-    ) -> String {
-        use gpui::size;
-
-        let (text, _) = cx.draw(
-            Default::default(),
-            size(px(600.0), px(600.0)),
-            |window, cx| Self::new(markdown, style(window, cx)),
-        );
-        text.text
-            .lines
-            .iter()
-            .map(|line| line.layout.wrapped_text())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    pub fn code_block_renderer(mut self, variant: CodeBlockRenderer) -> Self {
-        self.code_block_renderer = variant;
-        self
-    }
-
-    pub fn on_url_click(
-        mut self,
-        handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_url_click = Some(Box::new(handler));
-        self
     }
 
     fn paint_selection(
@@ -658,154 +648,6 @@ impl MarkdownElement {
         }
     }
 
-    fn paint_mouse_listeners(
-        &mut self,
-        hitbox: &Hitbox,
-        rendered_text: &RenderedText,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        if self.style.prevent_mouse_interaction {
-            return;
-        }
-
-        let is_hovering_link = hitbox.is_hovered(window)
-            && !self.markdown.read(cx).selection.pending
-            && rendered_text
-                .link_for_position(window.mouse_position())
-                .is_some();
-
-        if !self.style.prevent_mouse_interaction {
-            if is_hovering_link {
-                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
-            } else {
-                window.set_cursor_style(CursorStyle::IBeam, hitbox);
-            }
-        }
-
-        let on_open_url = self.on_url_click.take();
-
-        self.on_mouse_event(window, cx, {
-            let hitbox = hitbox.clone();
-            move |markdown, event: &MouseDownEvent, phase, window, _| {
-                if phase.capture()
-                    && event.button == MouseButton::Right
-                    && hitbox.is_hovered(window)
-                {
-                    // Capture selected text so it survives until menu item is clicked
-                    markdown.capture_selection_for_context_menu();
-                }
-            }
-        });
-
-        self.on_mouse_event(window, cx, {
-            let rendered_text = rendered_text.clone();
-            let hitbox = hitbox.clone();
-            move |markdown, event: &MouseDownEvent, phase, window, cx| {
-                if hitbox.is_hovered(window) {
-                    if phase.bubble() {
-                        if let Some(link) = rendered_text.link_for_position(event.position) {
-                            markdown.pressed_link = Some(link.clone());
-                        } else {
-                            let source_index =
-                                match rendered_text.source_index_for_position(event.position) {
-                                    Ok(ix) | Err(ix) => ix,
-                                };
-                            let (range, mode) = match event.click_count {
-                                1 => {
-                                    let range = source_index..source_index;
-                                    (range, SelectMode::Character)
-                                }
-                                2 => {
-                                    let range = rendered_text.surrounding_word_range(source_index);
-                                    (range.clone(), SelectMode::Word(range))
-                                }
-                                3 => {
-                                    let range = rendered_text.surrounding_line_range(source_index);
-                                    (range.clone(), SelectMode::Line(range))
-                                }
-                                _ => {
-                                    let range = 0..rendered_text
-                                        .lines
-                                        .last()
-                                        .map(|line| line.source_end)
-                                        .unwrap_or(0);
-                                    (range, SelectMode::All)
-                                }
-                            };
-                            markdown.selection = Selection {
-                                start: range.start,
-                                end: range.end,
-                                reversed: false,
-                                pending: true,
-                                mode,
-                            };
-                            window.focus(&markdown.focus_handle, cx);
-                        }
-
-                        window.prevent_default();
-                        cx.notify();
-                    }
-                } else if phase.capture() && event.button == MouseButton::Left {
-                    markdown.selection = Selection::default();
-                    markdown.pressed_link = None;
-                    cx.notify();
-                }
-            }
-        });
-        self.on_mouse_event(window, cx, {
-            let rendered_text = rendered_text.clone();
-            let hitbox = hitbox.clone();
-            let was_hovering_link = is_hovering_link;
-            move |markdown, event: &MouseMoveEvent, phase, window, cx| {
-                if phase.capture() {
-                    return;
-                }
-
-                if markdown.selection.pending {
-                    let source_index = match rendered_text.source_index_for_position(event.position)
-                    {
-                        Ok(ix) | Err(ix) => ix,
-                    };
-                    markdown.selection.set_head(source_index, &rendered_text);
-                    markdown.autoscroll_request = Some(source_index);
-                    cx.notify();
-                } else {
-                    let is_hovering_link = hitbox.is_hovered(window)
-                        && rendered_text.link_for_position(event.position).is_some();
-                    if is_hovering_link != was_hovering_link {
-                        cx.notify();
-                    }
-                }
-            }
-        });
-        self.on_mouse_event(window, cx, {
-            let rendered_text = rendered_text.clone();
-            move |markdown, event: &MouseUpEvent, phase, window, cx| {
-                if phase.bubble() {
-                    if let Some(pressed_link) = markdown.pressed_link.take()
-                        && Some(&pressed_link) == rendered_text.link_for_position(event.position)
-                    {
-                        if let Some(open_url) = on_open_url.as_ref() {
-                            open_url(pressed_link.destination_url, window, cx);
-                        } else {
-                            cx.open_url(&pressed_link.destination_url);
-                        }
-                    }
-                } else if markdown.selection.pending {
-                    markdown.selection.pending = false;
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    {
-                        let text = rendered_text
-                            .text_for_range(markdown.selection.start..markdown.selection.end);
-                        cx.write_to_primary(ClipboardItem::new_string(text))
-                    }
-                    cx.notify();
-                }
-            }
-        });
-    }
-
     fn autoscroll(
         &self,
         rendered_text: &RenderedText,
@@ -820,7 +662,7 @@ impl MarkdownElement {
         let text_style = self.style.base_text_style.clone();
         let font_id = window.text_system().resolve_font(&text_style.font());
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let em_width = window.text_system().em_width(font_id, font_size).unwrap();
+        let em_width = window.text_system().em_width(font_id, font_size).ok()?;
         window.request_autoscroll(Bounds::from_corners(
             point(position.x - 3. * em_width, position.y - 3. * line_height),
             point(position.x + 3. * em_width, position.y + 3. * line_height),
@@ -828,21 +670,348 @@ impl MarkdownElement {
         Some(())
     }
 
-    fn on_mouse_event<T: MouseEvent>(
-        &self,
-        window: &mut Window,
-        _cx: &mut App,
-        mut f: impl 'static
-        + FnMut(&mut Markdown, &T, DispatchPhase, &mut Window, &mut Context<Markdown>),
-    ) {
-        window.on_mouse_event({
-            let markdown = self.markdown.downgrade();
-            move |event, phase, window, cx| {
-                markdown
-                    .update(cx, |markdown, cx| f(markdown, event, phase, window, cx))
-                    .log_err();
+    fn register_mouse_listeners(&self, hitbox: &Hitbox, rendered_text: &RenderedText, ctx: &mut PaintCtx) {
+        if self.style.prevent_mouse_interaction {
+            return;
+        }
+
+        let markdown = self.markdown.clone();
+        let on_url_click = self.on_url_click.clone();
+
+        let is_hovering_link = hitbox.is_hovered(ctx.window)
+            && !markdown.read(ctx.cx).selection.pending
+            && rendered_text.link_for_position(ctx.window.mouse_position()).is_some();
+
+        if is_hovering_link {
+            ctx.window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        } else {
+            ctx.window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        }
+
+        // Mouse down - right click for context menu capture
+        ctx.on_mouse_down({
+            let markdown = markdown.clone();
+            let hitbox = hitbox.clone();
+            move |event, phase, _hitbox, window, cx| {
+                if phase == DispatchPhase::Capture
+                    && event.button == MouseButton::Right
+                    && hitbox.is_hovered(window)
+                {
+                    markdown.update(cx, |this, _| {
+                        this.capture_selection_for_context_menu();
+                    });
+                }
             }
         });
+
+        // Mouse down - selection start / link press
+        ctx.on_mouse_down({
+            let markdown = markdown.clone();
+            let rendered_text = rendered_text.clone();
+            let hitbox = hitbox.clone();
+            move |event, phase, _hitbox, window, cx| {
+                if hitbox.is_hovered(window) {
+                    if phase == DispatchPhase::Bubble {
+                        markdown.update(cx, |this, cx| {
+                            if let Some(link) = rendered_text.link_for_position(event.position) {
+                                this.pressed_link = Some(link.clone());
+                            } else {
+                                let source_index =
+                                    match rendered_text.source_index_for_position(event.position) {
+                                        Ok(ix) | Err(ix) => ix,
+                                    };
+                                let (range, mode) = match event.click_count {
+                                    1 => {
+                                        let range = source_index..source_index;
+                                        (range, SelectMode::Character)
+                                    }
+                                    2 => {
+                                        let range = rendered_text.surrounding_word_range(source_index);
+                                        (range.clone(), SelectMode::Word(range))
+                                    }
+                                    3 => {
+                                        let range = rendered_text.surrounding_line_range(source_index);
+                                        (range.clone(), SelectMode::Line(range))
+                                    }
+                                    _ => {
+                                        let range = 0..rendered_text
+                                            .lines
+                                            .last()
+                                            .map(|line| line.source_end)
+                                            .unwrap_or(0);
+                                        (range, SelectMode::All)
+                                    }
+                                };
+                                this.selection = Selection {
+                                    start: range.start,
+                                    end: range.end,
+                                    reversed: false,
+                                    pending: true,
+                                    mode,
+                                };
+                                window.focus(&this.focus_handle, cx);
+                            }
+
+                            window.prevent_default();
+                            cx.notify();
+                        });
+                    }
+                } else if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    markdown.update(cx, |this, cx| {
+                        this.selection = Selection::default();
+                        this.pressed_link = None;
+                        cx.notify();
+                    });
+                }
+            }
+        });
+
+        // Mouse move - selection extend
+        ctx.on_mouse_move({
+            let markdown = markdown.clone();
+            let rendered_text = rendered_text.clone();
+            let hitbox = hitbox.clone();
+            let was_hovering_link = is_hovering_link;
+            move |event, phase, _hitbox, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    return;
+                }
+
+                let is_pending = markdown.read(cx).selection.pending;
+                if is_pending {
+                    markdown.update(cx, |this, cx| {
+                        let source_index = match rendered_text.source_index_for_position(event.position)
+                        {
+                            Ok(ix) | Err(ix) => ix,
+                        };
+                        this.selection.set_head(source_index, &rendered_text);
+                        this.autoscroll_request = Some(source_index);
+                        cx.notify();
+                    });
+                } else {
+                    let is_hovering_link = hitbox.is_hovered(window)
+                        && rendered_text.link_for_position(event.position).is_some();
+                    if is_hovering_link != was_hovering_link {
+                        cx.notify(markdown.entity_id());
+                    }
+                }
+            }
+        });
+
+        // Mouse up - selection end / link click
+        ctx.on_mouse_up({
+            let markdown = markdown.clone();
+            let rendered_text = rendered_text.clone();
+            move |event, phase, _hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble {
+                    let pressed_link = markdown.read(cx).pressed_link.clone();
+                    if let Some(pressed_link) = pressed_link
+                        && Some(&pressed_link) == rendered_text.link_for_position(event.position)
+                    {
+                        markdown.update(cx, |this, _| {
+                            this.pressed_link = None;
+                        });
+                        if let Some(on_url_click) = on_url_click.as_ref() {
+                            on_url_click(pressed_link.destination_url, window, cx);
+                        } else {
+                            cx.open_url(&pressed_link.destination_url);
+                        }
+                    }
+                } else {
+                    let is_pending = markdown.read(cx).selection.pending;
+                    if is_pending {
+                        markdown.update(cx, |this, cx| {
+                            this.selection.pending = false;
+                            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                            {
+                                let text = rendered_text
+                                    .text_for_range(this.selection.start..this.selection.end);
+                                cx.write_to_primary(ClipboardItem::new_string(text))
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    fn register_actions(&self, ctx: &mut PaintCtx) {
+        let markdown = self.markdown.clone();
+        let rendered_text = self.rendered_text.clone();
+
+        ctx.window.on_action(std::any::TypeId::of::<crate::Copy>(), {
+            let markdown = markdown.clone();
+            let rendered_text = rendered_text.clone();
+            move |_, phase, window, cx| {
+                if phase == DispatchPhase::Bubble {
+                    if let Some(text) = rendered_text.as_ref() {
+                        markdown.update(cx, |this, cx| this.copy(text, window, cx));
+                    }
+                }
+            }
+        });
+
+        ctx.window.on_action(std::any::TypeId::of::<crate::CopyAsMarkdown>(), {
+            let markdown = markdown.clone();
+            move |_, phase, window, cx| {
+                if phase == DispatchPhase::Bubble {
+                    markdown.update(cx, |this, cx| this.copy_as_markdown(window, cx));
+                }
+            }
+        });
+    }
+}
+
+impl RenderNode for MarkdownNode {
+    fn taffy_style(&self, _rem_size: Pixels, _scale_factor: f32) -> TaffyStyle {
+        TaffyStyle::default()
+    }
+
+    fn layout_begin(&mut self, ctx: &mut LayoutCtx) -> LayoutFrame {
+        if let Some(build) = self.build_callback.take() {
+            let result = build(ctx.window, ctx.cx, &ctx.fiber_id);
+            self.pending_child = Some(result.element);
+            self.rendered_text = Some(result.text);
+        }
+
+        LayoutFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn layout_end(&mut self, _ctx: &mut LayoutCtx, _frame: LayoutFrame) {}
+
+    fn conditional_slots(&mut self, _fiber_id: GlobalElementId) -> SmallVec<[ConditionalSlot; 4]> {
+        let mut slots = SmallVec::new();
+
+        if let Some(child) = self.pending_child.take() {
+            slots.push(ConditionalSlot::active(0, move || child));
+        } else {
+            slots.push(ConditionalSlot {
+                slot_index: 0,
+                active: true,
+                element_factory: None,
+            });
+        }
+
+        slots
+    }
+
+    fn prepaint_begin(&mut self, ctx: &mut PrepaintCtx) -> PrepaintFrame {
+        self.bounds = Some(ctx.bounds);
+        self.hitbox = Some(ctx.insert_hitbox(ctx.bounds, HitboxBehavior::Normal));
+
+        if let Some(text) = &self.rendered_text {
+            self.autoscroll(text, ctx.window, ctx.cx);
+        }
+
+        PrepaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_end(&mut self, _ctx: &mut PrepaintCtx, _frame: PrepaintFrame) {}
+
+    fn paint_begin(&mut self, ctx: &mut PaintCtx) -> PaintFrame {
+        // Focus handle & view id
+        let focus_handle = self.markdown.read(ctx.cx).focus_handle.clone();
+        ctx.register_focus_handle(&focus_handle);
+        ctx.window.set_view_id(self.markdown.entity_id());
+
+        // Key context
+        let mut key_context = KeyContext::default();
+        key_context.add("Markdown");
+        ctx.register_key_context(key_context);
+
+        // Selection painting (before children so selection appears behind text)
+        if let (Some(bounds), Some(text)) = (self.bounds, &self.rendered_text) {
+            self.paint_selection(bounds, text, ctx.window, ctx.cx);
+        }
+
+        // Mouse listeners
+        if let Some(hitbox) = &self.hitbox {
+            if let Some(text) = &self.rendered_text {
+                self.register_mouse_listeners(hitbox, text, ctx);
+            }
+        }
+
+        // Action handlers
+        self.register_actions(ctx);
+
+        PaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn paint_end(&mut self, _ctx: &mut PaintCtx, _frame: PaintFrame) {}
+}
+
+#[derive(Element)]
+pub struct MarkdownElement {
+    markdown: Entity<Markdown>,
+    style: MarkdownStyle,
+    code_block_renderer: Rc<CodeBlockRenderer>,
+    on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
+}
+
+impl MarkdownElement {
+    pub fn new(markdown: Entity<Markdown>, style: MarkdownStyle) -> Self {
+        Self {
+            markdown,
+            style,
+            code_block_renderer: Rc::new(CodeBlockRenderer::Default {
+                copy_button: true,
+                copy_button_on_hover: false,
+                border: false,
+            }),
+            on_url_click: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_text(
+        markdown: Entity<Markdown>,
+        cx: &mut gpui::VisualTestContext,
+        style: impl FnOnce(&Window, &App) -> MarkdownStyle,
+    ) -> String {
+        cx.update(|window, cx| {
+            let style = style(window, cx);
+            let result = build_markdown_content(
+                markdown,
+                style,
+                Rc::new(CodeBlockRenderer::Default {
+                    copy_button: true,
+                    copy_button_on_hover: false,
+                    border: false,
+                }),
+                window,
+                cx,
+            );
+            result
+                .text
+                .lines
+                .iter()
+                .map(|line| line.layout.wrapped_text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    pub fn code_block_renderer(mut self, variant: CodeBlockRenderer) -> Self {
+        self.code_block_renderer = Rc::new(variant);
+        self
+    }
+
+    pub fn on_url_click(
+        mut self,
+        handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_url_click = Some(Rc::new(handler));
+        self
     }
 }
 
@@ -852,563 +1021,548 @@ impl Styled for MarkdownElement {
     }
 }
 
-impl Element for MarkdownElement {
-    type RequestLayoutState = RenderedMarkdown;
-    type PrepaintState = Hitbox;
-
-    fn id(&self) -> Option<ElementId> {
+impl ElementImpl for MarkdownElement {
+    fn id(&self) -> Option<gpui::ElementId> {
         None
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let mut builder = MarkdownElementBuilder::new(
-            &self.style.container_style,
-            self.style.base_text_style.clone(),
-            self.style.syntax.clone(),
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        let node = MarkdownNode::new(
+            self.markdown.clone(),
+            self.style.clone(),
+            self.on_url_click.take(),
         );
-        let (parsed_markdown, images) = {
-            let markdown = self.markdown.read(cx);
-            (
-                markdown.parsed_markdown.clone(),
-                markdown.images_by_source_offset.clone(),
-            )
-        };
-        let markdown_end = if let Some(last) = parsed_markdown.events.last() {
-            last.0.end
-        } else {
-            0
-        };
-        let mut code_block_ids = HashSet::default();
 
-        let mut current_img_block_range: Option<Range<usize>> = None;
-        for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
-            // Skip alt text for images that rendered
-            if let Some(current_img_block_range) = &current_img_block_range
-                && current_img_block_range.end > range.end
-            {
-                continue;
-            }
+        let markdown = self.markdown.clone();
+        let style = self.style.clone();
+        let code_block_renderer = self.code_block_renderer.clone();
 
-            match event {
-                MarkdownEvent::Start(tag) => {
-                    match tag {
-                        MarkdownTag::Image { .. } => {
-                            if let Some(image) = images.get(&range.start) {
-                                current_img_block_range = Some(range.clone());
-                                builder.modify_current_div(|el| {
-                                    el.items_center()
-                                        .flex()
-                                        .flex_row()
-                                        .child(img(image.clone()))
-                                });
+        node.build_callback.deposit(Box::new(move |window, cx, _fiber_id| {
+            build_markdown_content(markdown, style, code_block_renderer, window, cx)
+        }));
+
+        Some(Box::new(node))
+    }
+
+    fn render_node_type_id(&self) -> Option<std::any::TypeId> {
+        Some(std::any::TypeId::of::<MarkdownNode>())
+    }
+
+    fn update_render_node(
+        &mut self,
+        node: &mut dyn RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        let node = node.as_any_mut().downcast_mut::<MarkdownNode>()?;
+
+        node.markdown = self.markdown.clone();
+        node.style = self.style.clone();
+        node.on_url_click = self.on_url_click.take();
+
+        let markdown = self.markdown.clone();
+        let style = self.style.clone();
+        let code_block_renderer = self.code_block_renderer.clone();
+
+        node.build_callback.deposit(Box::new(move |window, cx, _fiber_id| {
+            build_markdown_content(markdown, style, code_block_renderer, window, cx)
+        }));
+
+        Some(UpdateResult::LAYOUT_CHANGED)
+    }
+}
+
+impl IntoElement for MarkdownElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+fn build_markdown_content(
+    markdown: Entity<Markdown>,
+    mut style: MarkdownStyle,
+    code_block_renderer: Rc<CodeBlockRenderer>,
+    window: &mut Window,
+    cx: &mut App,
+) -> MarkdownBuildResult {
+    let mut builder = MarkdownElementBuilder::new(
+        &style.container_style,
+        style.base_text_style.clone(),
+        style.syntax.clone(),
+    );
+    let (parsed_markdown, images) = {
+        let md = markdown.read(cx);
+        (
+            md.parsed_markdown.clone(),
+            md.images_by_source_offset.clone(),
+        )
+    };
+    let markdown_end = if let Some(last) = parsed_markdown.events.last() {
+        last.0.end
+    } else {
+        0
+    };
+    let mut code_block_ids = HashSet::default();
+
+    let mut current_img_block_range: Option<Range<usize>> = None;
+    for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
+        if let Some(current_img_block_range) = &current_img_block_range
+            && current_img_block_range.end > range.end
+        {
+            continue;
+        }
+
+        match event {
+            MarkdownEvent::Start(tag) => {
+                match tag {
+                    MarkdownTag::Image { .. } => {
+                        if let Some(image) = images.get(&range.start) {
+                            current_img_block_range = Some(range.clone());
+                            builder.modify_current_div(|el| {
+                                el.items_center()
+                                    .flex()
+                                    .flex_row()
+                                    .child(img(image.clone()))
+                            });
+                        }
+                    }
+                    MarkdownTag::Paragraph => {
+                        builder.push_div(
+                            div().when(!style.height_is_multiple_of_line_height, |el| {
+                                el.mb_2().line_height(rems(1.3))
+                            }),
+                            range,
+                            markdown_end,
+                        );
+                    }
+                    MarkdownTag::Heading { level, .. } => {
+                        let mut heading = div().mb_2();
+
+                        heading = apply_heading_style(
+                            heading,
+                            *level,
+                            style.heading_level_styles.as_ref(),
+                        );
+
+                        heading.style().refine(&style.heading);
+
+                        let text_style = style.heading.text_style().clone();
+
+                        builder.push_text_style(text_style);
+                        builder.push_div(heading, range, markdown_end);
+                    }
+                    MarkdownTag::BlockQuote => {
+                        builder.push_text_style(style.block_quote.clone());
+                        builder.push_div(
+                            div()
+                                .pl_4()
+                                .mb_2()
+                                .border_l_4()
+                                .border_color(style.block_quote_border_color),
+                            range,
+                            markdown_end,
+                        );
+                    }
+                    MarkdownTag::CodeBlock { kind, .. } => {
+                        let language = match kind {
+                            CodeBlockKind::Fenced => None,
+                            CodeBlockKind::FencedLang(language) => {
+                                parsed_markdown.languages_by_name.get(language).cloned()
                             }
-                        }
-                        MarkdownTag::Paragraph => {
-                            builder.push_div(
-                                div().when(!self.style.height_is_multiple_of_line_height, |el| {
-                                    el.mb_2().line_height(rems(1.3))
-                                }),
-                                range,
-                                markdown_end,
-                            );
-                        }
-                        MarkdownTag::Heading { level, .. } => {
-                            let mut heading = div().mb_2();
+                            CodeBlockKind::FencedSrc(path_range) => parsed_markdown
+                                .languages_by_path
+                                .get(&path_range.path)
+                                .cloned(),
+                            _ => None,
+                        };
 
-                            heading = apply_heading_style(
-                                heading,
-                                *level,
-                                self.style.heading_level_styles.as_ref(),
-                            );
+                        let is_indented = matches!(kind, CodeBlockKind::Indented);
+                        let scroll_handle = if style.code_block_overflow_x_scroll {
+                            code_block_ids.insert(range.start);
+                            Some(markdown.update(cx, |md, _| {
+                                md.code_block_scroll_handle(range.start)
+                            }))
+                        } else {
+                            None
+                        };
 
-                            heading.style().refine(&self.style.heading);
+                        match (&*code_block_renderer, is_indented) {
+                            (CodeBlockRenderer::Default { .. }, _) | (_, true) => {
+                                let parent_container =
+                                    div().group("code_block").relative().w_full();
 
-                            let text_style = self.style.heading.text_style().clone();
+                                let mut parent_container: Div = if let Some(scroll_handle) =
+                                    scroll_handle.as_ref()
+                                {
+                                    let scrollbars = Scrollbars::new(ScrollAxes::Horizontal)
+                                        .id(("markdown-code-block-scrollbar", range.start))
+                                        .tracked_scroll_handle(scroll_handle)
+                                        .with_track_along(
+                                            ScrollAxes::Horizontal,
+                                            cx.theme().colors().editor_background,
+                                        )
+                                        .notify_content();
 
-                            builder.push_text_style(text_style);
-                            builder.push_div(heading, range, markdown_end);
-                        }
-                        MarkdownTag::BlockQuote => {
-                            builder.push_text_style(self.style.block_quote.clone());
-                            builder.push_div(
-                                div()
-                                    .pl_4()
-                                    .mb_2()
-                                    .border_l_4()
-                                    .border_color(self.style.block_quote_border_color),
-                                range,
-                                markdown_end,
-                            );
-                        }
-                        MarkdownTag::CodeBlock { kind, .. } => {
-                            let language = match kind {
-                                CodeBlockKind::Fenced => None,
-                                CodeBlockKind::FencedLang(language) => {
-                                    parsed_markdown.languages_by_name.get(language).cloned()
-                                }
-                                CodeBlockKind::FencedSrc(path_range) => parsed_markdown
-                                    .languages_by_path
-                                    .get(&path_range.path)
-                                    .cloned(),
-                                _ => None,
-                            };
-
-                            let is_indented = matches!(kind, CodeBlockKind::Indented);
-                            let scroll_handle = if self.style.code_block_overflow_x_scroll {
-                                code_block_ids.insert(range.start);
-                                Some(self.markdown.update(cx, |markdown, _| {
-                                    markdown.code_block_scroll_handle(range.start)
-                                }))
-                            } else {
-                                None
-                            };
-
-                            match (&self.code_block_renderer, is_indented) {
-                                (CodeBlockRenderer::Default { .. }, _) | (_, true) => {
-                                    // This is a parent container that we can position the copy button inside.
-                                    let parent_container =
-                                        div().group("code_block").relative().w_full();
-
-                                    let mut parent_container: AnyDiv = if let Some(scroll_handle) =
-                                        scroll_handle.as_ref()
-                                    {
-                                        let scrollbars = Scrollbars::new(ScrollAxes::Horizontal)
-                                            .id(("markdown-code-block-scrollbar", range.start))
-                                            .tracked_scroll_handle(scroll_handle)
-                                            .with_track_along(
-                                                ScrollAxes::Horizontal,
-                                                cx.theme().colors().editor_background,
-                                            )
-                                            .notify_content();
-
-                                        parent_container
-                                            .rounded_lg()
-                                            .custom_scrollbars(scrollbars, window, cx)
-                                            .into()
-                                    } else {
-                                        parent_container.into()
-                                    };
-
-                                    if let CodeBlockRenderer::Default { border: true, .. } =
-                                        &self.code_block_renderer
-                                    {
-                                        parent_container = parent_container
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().colors().border_variant);
-                                    }
-
-                                    parent_container.style().refine(&self.style.code_block);
-                                    builder.push_div(parent_container, range, markdown_end);
-
-                                    let code_block = div()
-                                        .id(("code-block", range.start))
+                                    parent_container
                                         .rounded_lg()
-                                        .map(|mut code_block| {
-                                            if let Some(scroll_handle) = scroll_handle.as_ref() {
-                                                code_block.style().restrict_scroll_to_axis =
-                                                    Some(true);
-                                                code_block
-                                                    .flex()
-                                                    .overflow_x_scroll()
-                                                    .track_scroll(scroll_handle)
-                                            } else {
-                                                code_block.w_full()
-                                            }
-                                        });
+                                        .custom_scrollbars(scrollbars, window, cx)
+                                        .into()
+                                } else {
+                                    parent_container.into()
+                                };
 
-                                    builder.push_text_style(self.style.code_block.text.to_owned());
-                                    builder.push_code_block(language);
-                                    builder.push_div(code_block, range, markdown_end);
+                                if let CodeBlockRenderer::Default { border: true, .. } =
+                                    &*code_block_renderer
+                                {
+                                    parent_container = parent_container
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border_variant);
                                 }
-                                (CodeBlockRenderer::Custom { .. }, _) => {}
+
+                                parent_container.style().refine(&style.code_block);
+                                builder.push_div(parent_container, range, markdown_end);
+
+                                let code_block = div()
+                                    .id(("code-block", range.start))
+                                    .rounded_lg()
+                                    .map(|mut code_block| {
+                                        if let Some(scroll_handle) = scroll_handle.as_ref() {
+                                            code_block.style().restrict_scroll_to_axis =
+                                                Some(true);
+                                            code_block
+                                                .flex()
+                                                .overflow_x_scroll()
+                                                .track_scroll(scroll_handle)
+                                        } else {
+                                            code_block.w_full()
+                                        }
+                                    });
+
+                                builder.push_text_style(style.code_block.text.to_owned());
+                                builder.push_code_block(language);
+                                builder.push_div(code_block, range, markdown_end);
                             }
+                            (CodeBlockRenderer::Custom { .. }, _) => {}
                         }
-                        MarkdownTag::HtmlBlock => builder.push_div(div(), range, markdown_end),
-                        MarkdownTag::List(bullet_index) => {
-                            builder.push_list(*bullet_index);
-                            builder.push_div(div().pl_2p5(), range, markdown_end);
-                        }
-                        MarkdownTag::Item => {
-                            let bullet = if let Some((_, MarkdownEvent::TaskListMarker(checked))) =
-                                parsed_markdown.events.get(index.saturating_add(1))
-                            {
-                                let source = &parsed_markdown.source()[range.clone()];
-
-                                Checkbox::new(
-                                    ElementId::Name(source.to_string().into()),
-                                    if *checked {
-                                        ToggleState::Selected
-                                    } else {
-                                        ToggleState::Unselected
-                                    },
-                                )
-                                .fill()
-                                .visualization_only(true)
-                                .into_any_element()
-                            } else if let Some(bullet_index) = builder.next_bullet_index() {
-                                div().child(format!("{}.", bullet_index)).into_any_element()
-                            } else {
-                                div().child("•").into_any_element()
-                            };
-                            builder.push_div(
-                                div()
-                                    .when(!self.style.height_is_multiple_of_line_height, |el| {
-                                        el.mb_1().gap_1().line_height(rems(1.3))
-                                    })
-                                    .h_flex()
-                                    .items_start()
-                                    .child(bullet),
-                                range,
-                                markdown_end,
-                            );
-                            // Without `w_0`, text doesn't wrap to the width of the container.
-                            builder.push_div(div().flex_1().w_0(), range, markdown_end);
-                        }
-                        MarkdownTag::Emphasis => builder.push_text_style(TextStyleRefinement {
-                            font_style: Some(FontStyle::Italic),
-                            ..Default::default()
-                        }),
-                        MarkdownTag::Strong => builder.push_text_style(TextStyleRefinement {
-                            font_weight: Some(FontWeight::BOLD),
-                            ..Default::default()
-                        }),
-                        MarkdownTag::Strikethrough => {
-                            builder.push_text_style(TextStyleRefinement {
-                                strikethrough: Some(StrikethroughStyle {
-                                    thickness: px(1.),
-                                    color: None,
-                                }),
-                                ..Default::default()
-                            })
-                        }
-                        MarkdownTag::Link { dest_url, .. } => {
-                            if builder.code_block_stack.is_empty() {
-                                builder.push_link(dest_url.clone(), range.clone());
-                                let style = self
-                                    .style
-                                    .link_callback
-                                    .as_ref()
-                                    .and_then(|callback| callback(dest_url, cx))
-                                    .unwrap_or_else(|| self.style.link.clone());
-                                builder.push_text_style(style)
-                            }
-                        }
-                        MarkdownTag::MetadataBlock(_) => {}
-                        MarkdownTag::Table(alignments) => {
-                            builder.table.start(alignments.clone());
-
-                            let column_count = alignments.len();
-                            builder.push_div(
-                                div()
-                                    .id(("table", range.start))
-                                    .grid()
-                                    .grid_cols(column_count as u16)
-                                    .when(self.style.table_columns_min_size, |this| {
-                                        this.grid_cols_min_content(column_count as u16)
-                                    })
-                                    .when(!self.style.table_columns_min_size, |this| {
-                                        this.grid_cols(column_count as u16)
-                                    })
-                                    .w_full()
-                                    .mb_2()
-                                    .border(px(1.5))
-                                    .border_color(cx.theme().colors().border)
-                                    .rounded_sm()
-                                    .overflow_hidden(),
-                                range,
-                                markdown_end,
-                            );
-                        }
-                        MarkdownTag::TableHead => {
-                            builder.table.start_head();
-                            builder.push_text_style(TextStyleRefinement {
-                                font_weight: Some(FontWeight::SEMIBOLD),
-                                ..Default::default()
-                            });
-                        }
-                        MarkdownTag::TableRow => {
-                            builder.table.start_row();
-                        }
-                        MarkdownTag::TableCell => {
-                            let is_header = builder.table.in_head;
-                            let row_index = builder.table.row_index;
-                            let col_index = builder.table.col_index;
-
-                            builder.push_div(
-                                div()
-                                    .when(col_index > 0, |this| this.border_l_1())
-                                    .when(row_index > 0, |this| this.border_t_1())
-                                    .border_color(cx.theme().colors().border)
-                                    .px_1()
-                                    .py_0p5()
-                                    .when(is_header, |this| {
-                                        this.bg(cx.theme().colors().title_bar_background)
-                                    })
-                                    .when(!is_header && row_index % 2 == 1, |this| {
-                                        this.bg(cx.theme().colors().panel_background)
-                                    }),
-                                range,
-                                markdown_end,
-                            );
-                        }
-                        _ => log::debug!("unsupported markdown tag {:?}", tag),
                     }
-                }
-                MarkdownEvent::End(tag) => match tag {
-                    MarkdownTagEnd::Image => {
-                        current_img_block_range.take();
+                    MarkdownTag::HtmlBlock => builder.push_div(div(), range, markdown_end),
+                    MarkdownTag::List(bullet_index) => {
+                        builder.push_list(*bullet_index);
+                        builder.push_div(div().pl_2p5(), range, markdown_end);
                     }
-                    MarkdownTagEnd::Paragraph => {
-                        builder.pop_div();
-                    }
-                    MarkdownTagEnd::Heading(_) => {
-                        builder.pop_div();
-                        builder.pop_text_style()
-                    }
-                    MarkdownTagEnd::BlockQuote(_kind) => {
-                        builder.pop_text_style();
-                        builder.pop_div()
-                    }
-                    MarkdownTagEnd::CodeBlock => {
-                        builder.trim_trailing_newline();
-
-                        builder.pop_div();
-                        builder.pop_code_block();
-                        builder.pop_text_style();
-
-                        if let CodeBlockRenderer::Default {
-                            copy_button: true, ..
-                        } = &self.code_block_renderer
+                    MarkdownTag::Item => {
+                        let bullet = if let Some((_, MarkdownEvent::TaskListMarker(checked))) =
+                            parsed_markdown.events.get(index.saturating_add(1))
                         {
-                            builder.modify_current_div(|el| {
-                                let content_range = parser::extract_code_block_content_range(
-                                    &parsed_markdown.source()[range.clone()],
-                                );
-                                let content_range = content_range.start + range.start
-                                    ..content_range.end + range.start;
+                            let source = &parsed_markdown.source()[range.clone()];
 
-                                let code = parsed_markdown.source()[content_range].to_string();
-                                let codeblock = render_copy_code_block_button(
-                                    range.end,
-                                    code,
-                                    self.markdown.clone(),
-                                );
-                                el.child(
-                                    h_flex()
-                                        .w_4()
-                                        .absolute()
-                                        .top_1p5()
-                                        .right_1p5()
-                                        .justify_end()
-                                        .child(codeblock),
-                                )
-                            });
-                        }
-
-                        if let CodeBlockRenderer::Default {
-                            copy_button_on_hover: true,
-                            ..
-                        } = &self.code_block_renderer
-                        {
-                            builder.modify_current_div(|el| {
-                                let content_range = parser::extract_code_block_content_range(
-                                    &parsed_markdown.source()[range.clone()],
-                                );
-                                let content_range = content_range.start + range.start
-                                    ..content_range.end + range.start;
-
-                                let code = parsed_markdown.source()[content_range].to_string();
-                                let codeblock = render_copy_code_block_button(
-                                    range.end,
-                                    code,
-                                    self.markdown.clone(),
-                                );
-                                el.child(
-                                    h_flex()
-                                        .w_4()
-                                        .absolute()
-                                        .top_0()
-                                        .right_0()
-                                        .justify_end()
-                                        .visible_on_hover("code_block")
-                                        .child(codeblock),
-                                )
-                            });
-                        }
-
-                        // Pop the parent container.
-                        builder.pop_div();
+                            Checkbox::new(
+                                ElementId::Name(source.to_string().into()),
+                                if *checked {
+                                    ToggleState::Selected
+                                } else {
+                                    ToggleState::Unselected
+                                },
+                            )
+                            .fill()
+                            .visualization_only(true)
+                            .into_any_element()
+                        } else if let Some(bullet_index) = builder.next_bullet_index() {
+                            div().child(format!("{}.", bullet_index)).into_any_element()
+                        } else {
+                            div().child("•").into_any_element()
+                        };
+                        builder.push_div(
+                            div()
+                                .when(!style.height_is_multiple_of_line_height, |el| {
+                                    el.mb_1().gap_1().line_height(rems(1.3))
+                                })
+                                .h_flex()
+                                .items_start()
+                                .child(bullet),
+                            range,
+                            markdown_end,
+                        );
+                        builder.push_div(div().flex_1().w_0(), range, markdown_end);
                     }
-                    MarkdownTagEnd::HtmlBlock => builder.pop_div(),
-                    MarkdownTagEnd::List(_) => {
-                        builder.pop_list();
-                        builder.pop_div();
+                    MarkdownTag::Emphasis => builder.push_text_style(TextStyleRefinement {
+                        font_style: Some(FontStyle::Italic),
+                        ..Default::default()
+                    }),
+                    MarkdownTag::Strong => builder.push_text_style(TextStyleRefinement {
+                        font_weight: Some(FontWeight::BOLD),
+                        ..Default::default()
+                    }),
+                    MarkdownTag::Strikethrough => {
+                        builder.push_text_style(TextStyleRefinement {
+                            strikethrough: Some(StrikethroughStyle {
+                                thickness: px(1.),
+                                color: None,
+                            }),
+                            ..Default::default()
+                        })
                     }
-                    MarkdownTagEnd::Item => {
-                        builder.pop_div();
-                        builder.pop_div();
-                    }
-                    MarkdownTagEnd::Emphasis => builder.pop_text_style(),
-                    MarkdownTagEnd::Strong => builder.pop_text_style(),
-                    MarkdownTagEnd::Strikethrough => builder.pop_text_style(),
-                    MarkdownTagEnd::Link => {
+                    MarkdownTag::Link { dest_url, .. } => {
                         if builder.code_block_stack.is_empty() {
-                            builder.pop_text_style()
+                            builder.push_link(dest_url.clone(), range.clone());
+                            let link_style = style
+                                .link_callback
+                                .as_ref()
+                                .and_then(|callback| callback(dest_url, cx))
+                                .unwrap_or_else(|| style.link.clone());
+                            builder.push_text_style(link_style)
                         }
                     }
-                    MarkdownTagEnd::Table => {
-                        builder.pop_div();
-                        builder.table.end();
+                    MarkdownTag::MetadataBlock(_) => {}
+                    MarkdownTag::Table(alignments) => {
+                        builder.table.start(alignments.clone());
+
+                        let column_count = alignments.len();
+                        builder.push_div(
+                            div()
+                                .id(("table", range.start))
+                                .grid()
+                                .grid_cols(column_count as u16)
+                                .when(style.table_columns_min_size, |this| {
+                                    this.grid_cols_min_content(column_count as u16)
+                                })
+                                .when(!style.table_columns_min_size, |this| {
+                                    this.grid_cols(column_count as u16)
+                                })
+                                .w_full()
+                                .mb_2()
+                                .border(px(1.5))
+                                .border_color(cx.theme().colors().border)
+                                .rounded_sm()
+                                .overflow_hidden(),
+                            range,
+                            markdown_end,
+                        );
                     }
-                    MarkdownTagEnd::TableHead => {
-                        builder.pop_text_style();
-                        builder.table.end_head();
+                    MarkdownTag::TableHead => {
+                        builder.table.start_head();
+                        builder.push_text_style(TextStyleRefinement {
+                            font_weight: Some(FontWeight::SEMIBOLD),
+                            ..Default::default()
+                        });
                     }
-                    MarkdownTagEnd::TableRow => {
-                        builder.table.end_row();
+                    MarkdownTag::TableRow => {
+                        builder.table.start_row();
                     }
-                    MarkdownTagEnd::TableCell => {
-                        builder.pop_div();
-                        builder.table.end_cell();
+                    MarkdownTag::TableCell => {
+                        let is_header = builder.table.in_head;
+                        let row_index = builder.table.row_index;
+                        let col_index = builder.table.col_index;
+
+                        builder.push_div(
+                            div()
+                                .when(col_index > 0, |this| this.border_l_1())
+                                .when(row_index > 0, |this| this.border_t_1())
+                                .border_color(cx.theme().colors().border)
+                                .px_1()
+                                .py_0p5()
+                                .when(is_header, |this| {
+                                    this.bg(cx.theme().colors().title_bar_background)
+                                })
+                                .when(!is_header && row_index % 2 == 1, |this| {
+                                    this.bg(cx.theme().colors().panel_background)
+                                }),
+                            range,
+                            markdown_end,
+                        );
                     }
-                    _ => log::debug!("unsupported markdown tag end: {:?}", tag),
-                },
-                MarkdownEvent::Text => {
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    _ => log::debug!("unsupported markdown tag {:?}", tag),
                 }
-                MarkdownEvent::SubstitutedText(text) => {
-                    builder.push_text(text, range.clone());
+            }
+            MarkdownEvent::End(tag) => match tag {
+                MarkdownTagEnd::Image => {
+                    current_img_block_range.take();
                 }
-                MarkdownEvent::Code => {
-                    builder.push_text_style(self.style.inline_code.clone());
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                MarkdownTagEnd::Paragraph => {
+                    builder.pop_div();
+                }
+                MarkdownTagEnd::Heading(_) => {
+                    builder.pop_div();
+                    builder.pop_text_style()
+                }
+                MarkdownTagEnd::BlockQuote(_kind) => {
                     builder.pop_text_style();
-                }
-                MarkdownEvent::Html => {
-                    let html = &parsed_markdown.source[range.clone()];
-                    if html.starts_with("<!--") {
-                        builder.html_comment = true;
-                    }
-                    if html.trim_end().ends_with("-->") {
-                        builder.html_comment = false;
-                        continue;
-                    }
-                    if builder.html_comment {
-                        continue;
-                    }
-                    builder.push_text(html, range.clone());
-                }
-                MarkdownEvent::InlineHtml => {
-                    let html = &parsed_markdown.source[range.clone()];
-                    if html.starts_with("<code>") {
-                        builder.push_text_style(self.style.inline_code.clone());
-                        continue;
-                    }
-                    if html.trim_end().starts_with("</code>") {
-                        builder.pop_text_style();
-                        continue;
-                    }
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
-                }
-                MarkdownEvent::Rule => {
-                    builder.push_div(
-                        div()
-                            .border_b_1()
-                            .my_2()
-                            .border_color(self.style.rule_color),
-                        range,
-                        markdown_end,
-                    );
                     builder.pop_div()
                 }
-                MarkdownEvent::SoftBreak => builder.push_text(" ", range.clone()),
-                MarkdownEvent::HardBreak => builder.push_text("\n", range.clone()),
-                MarkdownEvent::TaskListMarker(_) => {
-                    // handled inside the `MarkdownTag::Item` case
+                MarkdownTagEnd::CodeBlock => {
+                    builder.trim_trailing_newline();
+
+                    builder.pop_div();
+                    builder.pop_code_block();
+                    builder.pop_text_style();
+
+                    if let CodeBlockRenderer::Default {
+                        copy_button: true, ..
+                    } = &*code_block_renderer
+                    {
+                        builder.modify_current_div(|el| {
+                            let content_range = parser::extract_code_block_content_range(
+                                &parsed_markdown.source()[range.clone()],
+                            );
+                            let content_range = content_range.start + range.start
+                                ..content_range.end + range.start;
+
+                            let code = parsed_markdown.source()[content_range].to_string();
+                            let codeblock = render_copy_code_block_button(
+                                range.end,
+                                code,
+                                markdown.clone(),
+                            );
+                            el.child(
+                                h_flex()
+                                    .w_4()
+                                    .absolute()
+                                    .top_1p5()
+                                    .right_1p5()
+                                    .justify_end()
+                                    .child(codeblock),
+                            )
+                        });
+                    }
+
+                    if let CodeBlockRenderer::Default {
+                        copy_button_on_hover: true,
+                        ..
+                    } = &*code_block_renderer
+                    {
+                        builder.modify_current_div(|el| {
+                            let content_range = parser::extract_code_block_content_range(
+                                &parsed_markdown.source()[range.clone()],
+                            );
+                            let content_range = content_range.start + range.start
+                                ..content_range.end + range.start;
+
+                            let code = parsed_markdown.source()[content_range].to_string();
+                            let codeblock = render_copy_code_block_button(
+                                range.end,
+                                code,
+                                markdown.clone(),
+                            );
+                            el.child(
+                                h_flex()
+                                    .w_4()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .justify_end()
+                                    .visible_on_hover("code_block")
+                                    .child(codeblock),
+                            )
+                        });
+                    }
+
+                    builder.pop_div();
                 }
-                _ => log::debug!("unsupported markdown event {:?}", event),
+                MarkdownTagEnd::HtmlBlock => builder.pop_div(),
+                MarkdownTagEnd::List(_) => {
+                    builder.pop_list();
+                    builder.pop_div();
+                }
+                MarkdownTagEnd::Item => {
+                    builder.pop_div();
+                    builder.pop_div();
+                }
+                MarkdownTagEnd::Emphasis => builder.pop_text_style(),
+                MarkdownTagEnd::Strong => builder.pop_text_style(),
+                MarkdownTagEnd::Strikethrough => builder.pop_text_style(),
+                MarkdownTagEnd::Link => {
+                    if builder.code_block_stack.is_empty() {
+                        builder.pop_text_style()
+                    }
+                }
+                MarkdownTagEnd::Table => {
+                    builder.pop_div();
+                    builder.table.end();
+                }
+                MarkdownTagEnd::TableHead => {
+                    builder.pop_text_style();
+                    builder.table.end_head();
+                }
+                MarkdownTagEnd::TableRow => {
+                    builder.table.end_row();
+                }
+                MarkdownTagEnd::TableCell => {
+                    builder.pop_div();
+                    builder.table.end_cell();
+                }
+                _ => log::debug!("unsupported markdown tag end: {:?}", tag),
+            },
+            MarkdownEvent::Text => {
+                builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
             }
+            MarkdownEvent::SubstitutedText(text) => {
+                builder.push_text(text, range.clone());
+            }
+            MarkdownEvent::Code => {
+                builder.push_text_style(style.inline_code.clone());
+                builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                builder.pop_text_style();
+            }
+            MarkdownEvent::Html => {
+                let html = &parsed_markdown.source[range.clone()];
+                if html.starts_with("<!--") {
+                    builder.html_comment = true;
+                }
+                if html.trim_end().ends_with("-->") {
+                    builder.html_comment = false;
+                    continue;
+                }
+                if builder.html_comment {
+                    continue;
+                }
+                builder.push_text(html, range.clone());
+            }
+            MarkdownEvent::InlineHtml => {
+                let html = &parsed_markdown.source[range.clone()];
+                if html.starts_with("<code>") {
+                    builder.push_text_style(style.inline_code.clone());
+                    continue;
+                }
+                if html.trim_end().starts_with("</code>") {
+                    builder.pop_text_style();
+                    continue;
+                }
+                builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+            }
+            MarkdownEvent::Rule => {
+                builder.push_div(
+                    div()
+                        .border_b_1()
+                        .my_2()
+                        .border_color(style.rule_color),
+                    range,
+                    markdown_end,
+                );
+                builder.pop_div()
+            }
+            MarkdownEvent::SoftBreak => builder.push_text(" ", range.clone()),
+            MarkdownEvent::HardBreak => builder.push_text("\n", range.clone()),
+            MarkdownEvent::TaskListMarker(_) => {
+                // handled inside the `MarkdownTag::Item` case
+            }
+            _ => log::debug!("unsupported markdown event {:?}", event),
         }
-        if self.style.code_block_overflow_x_scroll {
-            let code_block_ids = code_block_ids;
-            self.markdown.update(cx, move |markdown, _| {
-                markdown.retain_code_block_scroll_handles(&code_block_ids);
-            });
-        } else {
-            self.markdown
-                .update(cx, |markdown, _| markdown.clear_code_block_scroll_handles());
-        }
-        let mut rendered_markdown = builder.build();
-        let child_layout_id = rendered_markdown.element.request_layout(window, cx);
-        let layout_id = window.request_layout(gpui::Style::default(), [child_layout_id], cx);
-        (layout_id, rendered_markdown)
     }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        rendered_markdown: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let focus_handle = self.markdown.read(cx).focus_handle.clone();
-        window.set_focus_handle(&focus_handle, cx);
-        window.set_view_id(self.markdown.entity_id());
-
-        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        rendered_markdown.element.prepaint(window, cx);
-        self.autoscroll(&rendered_markdown.text, window, cx);
-        hitbox
+    if style.code_block_overflow_x_scroll {
+        let code_block_ids = code_block_ids;
+        markdown.update(cx, move |md, _| {
+            md.retain_code_block_scroll_handles(&code_block_ids);
+        });
+    } else {
+        markdown.update(cx, |md, _| md.clear_code_block_scroll_handles());
     }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        rendered_markdown: &mut Self::RequestLayoutState,
-        hitbox: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let mut context = KeyContext::default();
-        context.add("Markdown");
-        window.set_key_context(context);
-        window.on_action(std::any::TypeId::of::<crate::Copy>(), {
-            let entity = self.markdown.clone();
-            let text = rendered_markdown.text.clone();
-            move |_, phase, window, cx| {
-                let text = text.clone();
-                if phase == DispatchPhase::Bubble {
-                    entity.update(cx, move |this, cx| this.copy(&text, window, cx))
-                }
-            }
-        });
-        window.on_action(std::any::TypeId::of::<crate::CopyAsMarkdown>(), {
-            let entity = self.markdown.clone();
-            move |_, phase, window, cx| {
-                if phase == DispatchPhase::Bubble {
-                    entity.update(cx, move |this, cx| this.copy_as_markdown(window, cx))
-                }
-            }
-        });
-
-        self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
-        rendered_markdown.element.paint(window, cx);
-        self.paint_selection(bounds, &rendered_markdown.text, window, cx);
+    let rendered_markdown = builder.build();
+    MarkdownBuildResult {
+        element: rendered_markdown.element,
+        text: rendered_markdown.text,
     }
 }
 
@@ -1477,58 +1631,6 @@ fn render_copy_code_block_button(
     })
 }
 
-impl IntoElement for MarkdownElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-pub enum AnyDiv {
-    Div(Div),
-    Stateful(Stateful<Div>),
-}
-
-impl AnyDiv {
-    fn into_any_element(self) -> AnyElement {
-        match self {
-            Self::Div(div) => div.into_any_element(),
-            Self::Stateful(div) => div.into_any_element(),
-        }
-    }
-}
-
-impl From<Div> for AnyDiv {
-    fn from(value: Div) -> Self {
-        Self::Div(value)
-    }
-}
-
-impl From<Stateful<Div>> for AnyDiv {
-    fn from(value: Stateful<Div>) -> Self {
-        Self::Stateful(value)
-    }
-}
-
-impl Styled for AnyDiv {
-    fn style(&mut self) -> &mut StyleRefinement {
-        match self {
-            Self::Div(div) => div.style(),
-            Self::Stateful(div) => div.style(),
-        }
-    }
-}
-
-impl ParentElement for AnyDiv {
-    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
-        match self {
-            Self::Div(div) => div.extend(elements),
-            Self::Stateful(div) => div.extend(elements),
-        }
-    }
-}
-
 #[derive(Default)]
 struct TableState {
     alignments: Vec<Alignment>,
@@ -1574,7 +1676,7 @@ impl TableState {
 }
 
 struct MarkdownElementBuilder {
-    div_stack: Vec<AnyDiv>,
+    div_stack: Vec<Div>,
     rendered_lines: Vec<RenderedLine>,
     pending_line: PendingLine,
     rendered_links: Vec<RenderedLink>,
@@ -1641,7 +1743,7 @@ impl MarkdownElementBuilder {
         self.text_style_stack.pop();
     }
 
-    fn push_div(&mut self, div: impl Into<AnyDiv>, range: &Range<usize>, markdown_end: usize) {
+    fn push_div(&mut self, div: impl Into<Div>, range: &Range<usize>, markdown_end: usize) {
         let mut div = div.into();
         self.flush_text();
 
@@ -1673,7 +1775,7 @@ impl MarkdownElementBuilder {
         self.div_stack.push(div);
     }
 
-    fn modify_current_div(&mut self, f: impl FnOnce(AnyDiv) -> AnyDiv) {
+    fn modify_current_div(&mut self, f: impl FnOnce(Div) -> Div) {
         self.flush_text();
         if let Some(div) = self.div_stack.pop() {
             self.div_stack.push(f(div));
@@ -1770,7 +1872,7 @@ impl MarkdownElementBuilder {
             return;
         }
 
-        let text = StyledText::new(line.text).with_runs(line.runs);
+        let text = line.text.with_runs(line.runs);
         self.rendered_lines.push(RenderedLine {
             layout: text.layout().clone(),
             source_mappings: line.source_mappings,

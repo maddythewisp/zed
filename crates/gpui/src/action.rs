@@ -291,6 +291,7 @@ impl ActionRegistry {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn load_action<A: Action>(&mut self) {
         self.insert_action(MacroActionData {
             name: A::name_for_type(),

@@ -18,6 +18,7 @@ workspace = true
 
 [features]
 default = ["font-kit", "wayland", "x11", "windows-manifest"]
+diagnostics = []
 test-support = [
     "leak-detection",
     "collections/test-support",
@@ -38,7 +39,6 @@ macos-blade = [
     "objc2-metal",
 ]
 wayland = [
-    "bitflags",
     "blade-graphics",
     "blade-macros",
     "blade-util",
@@ -87,7 +87,7 @@ doctest = false
 anyhow.workspace = true
 async-task = "4.7"
 backtrace = { workspace = true, optional = true }
-bitflags = { workspace = true, optional = true }
+bitflags.workspace = true
 blade-graphics = { workspace = true, optional = true }
 blade-macros = { workspace = true, optional = true }
 blade-util = { workspace = true, optional = true }
@@ -128,7 +128,6 @@ serde_json.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 smol.workspace = true
-stacksafe.workspace = true
 strum.workspace = true
 sum_tree.workspace = true
 taffy = "=0.9.0"

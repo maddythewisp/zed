@@ -59,7 +59,7 @@ use settings::{Settings, update_settings_file};
 use theme::ThemeSettings;
 use ui::{
     Callout, ContextMenu, ContextMenuEntry, KeyBinding, PopoverMenu, PopoverMenuHandle, Tab,
-    Tooltip, prelude::*, utils::WithRemSize,
+    Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -2859,12 +2859,11 @@ impl Render for AgentPanel {
             .children(self.render_trial_end_upsell(window, cx));
 
         match self.active_view.which_font_size_used() {
-            WhichFontSize::AgentFont => {
-                WithRemSize::new(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
-                    .size_full()
-                    .child(content)
-                    .into_any()
-            }
+            WhichFontSize::AgentFont => div()
+                .rem(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
+                .size_full()
+                .child(content)
+                .into_any(),
             _ => content.into_any(),
         }
     }

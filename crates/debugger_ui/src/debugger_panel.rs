@@ -19,7 +19,7 @@ use feature_flags::{FeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
     Action, App, AsyncWindowContext, ClipboardItem, Context, Corner, DismissEvent, Entity,
     EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Point,
-    Subscription, Task, WeakEntity, anchored, deferred,
+    Subscription, Task, WeakEntity, anchored,
 };
 
 use itertools::Itertools as _;
@@ -1794,13 +1794,11 @@ impl Render for DebugPanel {
                     }),
                 )
                 .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                    deferred(
-                        anchored()
-                            .position(*position)
-                            .anchor(gpui::Corner::TopLeft)
-                            .child(menu.clone()),
-                    )
-                    .with_priority(1)
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Corner::TopLeft)
+                        .child(menu.clone())
+                        .z_index(1)
                 }))
             })
             .map(|this| {

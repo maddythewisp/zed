@@ -53,7 +53,7 @@ use task::{
 };
 use terminal_view::TerminalView;
 use ui::{
-    FluentBuilder, IntoElement, Render, StatefulInteractiveElement, Tab, Tooltip, VisibleOnHover,
+    FluentBuilder, IntoElement, Render, Tab, Tooltip, VisibleOnHover,
     VisualContext, prelude::*,
 };
 use util::ResultExt;

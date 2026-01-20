@@ -4,8 +4,8 @@ use futures::channel::oneshot;
 
 use crate::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, PromptButton, PromptLevel, Render,
-    StatefulInteractiveElement, Styled, div, opaque_grey, white,
+    InteractiveElement, IntoElement, ParentElement, PromptButton, PromptLevel, Render, Styled, div,
+    opaque_grey, white,
 };
 
 use super::Window;

@@ -10,8 +10,8 @@ use editor::{MultiBufferOffset, RowHighlightOptions, SelectionEffects};
 use fuzzy::StringMatch;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    ParentElement, Point, Render, Styled, StyledText, Task, TextStyle, WeakEntity, Window, div,
-    rems,
+    ParentElement, Point, Render, Styled, StyledText, Task, TextElement, TextStyle, WeakEntity,
+    Window, div, rems,
 };
 use language::{Outline, OutlineItem};
 use ordered_float::OrderedFloat;
@@ -385,7 +385,7 @@ pub fn render_item<T>(
         outline_item.highlight_ranges.iter().cloned(),
     );
 
-    StyledText::new(outline_item.text.clone()).with_default_highlights(&text_style, highlights)
+    outline_item.text.clone().with_default_highlights(&text_style, highlights)
 }
 
 #[cfg(test)]

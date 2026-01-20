@@ -1,11 +1,10 @@
 use crate::{
     IconButtonShape, KeyBinding, List, ListItem, ListSeparator, ListSubHeader, Tooltip, prelude::*,
-    utils::WithRemSize,
 };
 use gpui::{
     Action, AnyElement, App, Bounds, Corner, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Size,
-    Subscription, anchored, canvas, prelude::*, px,
+    Subscription, anchored, prelude::*, px,
 };
 use menu::{SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious};
 use settings::Settings;
@@ -1442,21 +1441,12 @@ impl ContextMenu {
                         }))
                     })
                     .when(documentation_aside.is_some(), |this| {
-                        this.child(
-                            canvas(
-                                {
-                                    let aside_trigger_bounds = aside_trigger_bounds.clone();
-                                    move |bounds, _window, _cx| {
-                                        aside_trigger_bounds.borrow_mut().insert(ix, bounds);
-                                    }
-                                },
-                                |_bounds, _state, _window, _cx| {},
-                            )
-                            .size_full()
-                            .absolute()
-                            .top_0()
-                            .left_0(),
-                        )
+                        this.child(div().size_full().absolute().top_0().left_0().on_layout({
+                            let aside_trigger_bounds = aside_trigger_bounds.clone();
+                            move |bounds, _window, _cx| {
+                                aside_trigger_bounds.borrow_mut().insert(ix, bounds);
+                            }
+                        }))
                     })
                     .child(
                         ListItem::new(ix)
@@ -1537,23 +1527,14 @@ impl ContextMenu {
                 ListItem::new(ix)
                     .inset(true)
                     .toggle_state(toggle_state)
-                    .child(
-                        canvas(
-                            {
-                                let trigger_bounds_cell = self.submenu_trigger_bounds.clone();
-                                move |bounds, _window, _cx| {
-                                    if toggle_state {
-                                        trigger_bounds_cell.set(Some(bounds));
-                                    }
-                                }
-                            },
-                            |_bounds, _state, _window, _cx| {},
-                        )
-                        .size_full()
-                        .absolute()
-                        .top_0()
-                        .left_0(),
-                    )
+                    .child(div().size_full().absolute().top_0().left_0().on_layout({
+                        let trigger_bounds_cell = self.submenu_trigger_bounds.clone();
+                        move |bounds, _window, _cx| {
+                            if toggle_state {
+                                trigger_bounds_cell.set(Some(bounds));
+                            }
+                        }
+                    }))
                     .on_hover(cx.listener(move |this, hovered, window, cx| {
                         let mouse_pos = window.mouse_position();
 
@@ -1667,18 +1648,15 @@ impl ContextMenu {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let bounds_cell = self.main_menu_observed_bounds.clone();
-        let canvas = canvas(
-            {
-                move |bounds, _window, _cx| {
+        let bounds_observer =
+            div()
+                .size_full()
+                .absolute()
+                .top_0()
+                .left_0()
+                .on_layout(move |bounds, _window, _cx| {
                     bounds_cell.set(Some(bounds));
-                }
-            },
-            |_bounds, _state, _window, _cx| {},
-        )
-        .size_full()
-        .absolute()
-        .top_0()
-        .left_0();
+                });
 
         div()
             .id(("submenu-container", ix))
@@ -1699,7 +1677,7 @@ impl ContextMenu {
                         div()
                             .id(("submenu-hover-zone", ix))
                             .occlude()
-                            .child(canvas)
+                            .child(bounds_observer)
                             .child(submenu),
                     ),
             )
@@ -1828,21 +1806,12 @@ impl ContextMenu {
                     }))
             })
             .when(documentation_aside.is_some(), |this| {
-                this.child(
-                    canvas(
-                        {
-                            let aside_trigger_bounds = aside_trigger_bounds.clone();
-                            move |bounds, _window, _cx| {
-                                aside_trigger_bounds.borrow_mut().insert(ix, bounds);
-                            }
-                        },
-                        |_bounds, _state, _window, _cx| {},
-                    )
-                    .size_full()
-                    .absolute()
-                    .top_0()
-                    .left_0(),
-                )
+                this.child(div().size_full().absolute().top_0().left_0().on_layout({
+                    let aside_trigger_bounds = aside_trigger_bounds.clone();
+                    move |bounds, _window, _cx| {
+                        aside_trigger_bounds.borrow_mut().insert(ix, bounds);
+                    }
+                }))
             })
             .child(
                 ListItem::new(ix)
@@ -2101,7 +2070,8 @@ impl Render for ContextMenu {
 
         let aside = self.documentation_aside.clone();
         let render_aside = |aside: DocumentationAside, cx: &mut Context<Self>| {
-            WithRemSize::new(ui_font_size)
+            div()
+                .rem(ui_font_size)
                 .occlude()
                 .elevation_2(cx)
                 .w_full()
@@ -2114,20 +2084,14 @@ impl Render for ContextMenu {
 
         let render_menu = |cx: &mut Context<Self>, window: &mut Window| {
             let bounds_cell = self.main_menu_observed_bounds.clone();
-            let menu_bounds_measure = canvas(
-                {
-                    move |bounds, _window, _cx| {
-                        bounds_cell.set(Some(bounds));
-                    }
+            let menu_bounds_measure = div().size_full().absolute().top_0().left_0().on_layout(
+                move |bounds, _window, _cx| {
+                    bounds_cell.set(Some(bounds));
                 },
-                |_bounds, _state, _window, _cx| {},
-            )
-            .size_full()
-            .absolute()
-            .top_0()
-            .left_0();
+            );
 
-            WithRemSize::new(ui_font_size)
+            div()
+                .rem(ui_font_size)
                 .occlude()
                 .elevation_2(cx)
                 .flex()

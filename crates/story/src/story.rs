@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 pub struct Story {}
 
 impl Story {
-    pub fn container(cx: &App) -> gpui::Stateful<Div> {
+    pub fn container(cx: &App) -> Div {
         div()
             .id("story_container")
             .overflow_y_scroll()

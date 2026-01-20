@@ -12,7 +12,7 @@ use gpui::{
     Action, Along, AppContext, Axis, DismissEvent, DragMoveEvent, Empty, Entity, FocusHandle,
     Focusable, ListHorizontalSizingBehavior, MouseButton, Point, ScrollStrategy, ScrollWheelEvent,
     Subscription, Task, TextStyle, UniformList, UniformListScrollHandle, WeakEntity, actions,
-    anchored, deferred, uniform_list,
+    anchored, uniform_list,
 };
 use notifications::status_toast::{StatusToast, ToastIcon};
 use project::debugger::{MemoryCell, dap_command::DataBreakpointContext, session::Session};
@@ -20,7 +20,7 @@ use settings::Settings;
 use theme::ThemeSettings;
 use ui::{
     ContextMenu, Divider, DropdownMenu, FluentBuilder, IntoElement, PopoverMenuHandle, Render,
-    ScrollableHandle, StatefulInteractiveElement, Tooltip, WithScrollbar, prelude::*,
+    ScrollableHandle, Tooltip, WithScrollbar, prelude::*,
 };
 use workspace::Workspace;
 
@@ -911,13 +911,11 @@ impl Render for MemoryView {
                     }))
                     .child(self.render_memory(cx).size_full())
                     .children(self.open_context_menu.as_ref().map(|(menu, position, _)| {
-                        deferred(
-                            anchored()
-                                .position(*position)
-                                .anchor(gpui::Corner::TopLeft)
-                                .child(menu.clone()),
-                        )
-                        .with_priority(1)
+                        anchored()
+                            .position(*position)
+                            .anchor(gpui::Corner::TopLeft)
+                            .child(menu.clone())
+                            .z_index(1)
                     }))
                     .custom_scrollbars(
                         ui::Scrollbars::new(ui::ScrollAxes::Both)

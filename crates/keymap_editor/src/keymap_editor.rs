@@ -20,8 +20,8 @@ use gpui::{
     FocusHandle, Focusable, Global, IsZero,
     KeyBindingContextPredicate::{And, Descendant, Equal, Identifier, Not, NotEqual, Or},
     KeyContext, KeybindingKeystroke, MouseButton, PlatformKeyboardMapper, Point, ScrollStrategy,
-    ScrollWheelEvent, Stateful, StyledText, Subscription, Task, TextStyleRefinement, WeakEntity,
-    actions, anchored, deferred, div,
+    ScrollWheelEvent, Subscription, Task, TextElement, TextStyleRefinement, WeakEntity,
+    actions, anchored, div,
 };
 use language::{Language, LanguageConfig, ToOffset as _};
 use notifications::status_toast::{StatusToast, ToastIcon};
@@ -1649,9 +1649,9 @@ impl RenderOnce for KeybindContextString {
     }
 }
 
-fn muted_styled_text(text: SharedString, cx: &App) -> StyledText {
+fn muted_styled_text(text: SharedString, cx: &App) -> gpui::StyledText {
     let len = text.len();
-    StyledText::new(text).with_highlights([(
+    text.with_highlights([(
         0..len,
         gpui::HighlightStyle::color(cx.theme().colors().text_muted),
     )])
@@ -2060,7 +2060,7 @@ impl Render for KeymapEditor {
                         }),
                     )
                     .map_row(cx.processor(
-                        |this, (row_index, row): (usize, Stateful<Div>), _window, cx| {
+                        |this, (row_index, row): (usize, Div), _window, cx| {
                         let conflict = this.get_conflict(row_index);
                             let is_selected = this.selected_index == Some(row_index);
 
@@ -2152,13 +2152,11 @@ impl Render for KeymapEditor {
                 }
             }))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Corner::TopLeft)
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
+                anchored()
+                    .position(*position)
+                    .anchor(gpui::Corner::TopLeft)
+                    .child(menu.clone())
+                    .z_index(1)
             }))
     }
 }
@@ -2221,7 +2219,7 @@ impl RenderOnce for SyntaxHighlightedText {
             runs.push(text_style.to_run(text.len() - offset));
         }
 
-        StyledText::new(text).with_runs(runs)
+        text.with_runs(runs)
     }
 }
 

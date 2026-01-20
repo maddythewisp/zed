@@ -306,7 +306,7 @@ impl Render for ImageView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.image_item.read(cx).image.clone();
         let checkered_background =
-            |bounds: Bounds<Pixels>, _, window: &mut Window, _cx: &mut App| {
+            |bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, _cx: &mut App| {
                 let square_size: f32 = 32.0;
 
                 let start_y = bounds.origin.y.into();

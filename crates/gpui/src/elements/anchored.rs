@@ -1,18 +1,20 @@
+use gpui_macros::Element;
 use smallvec::SmallVec;
+use std::any::TypeId;
 
+use crate::fiber::AnchoredConfig;
+use crate::geometry::IsZero;
+use crate::taffy::ToTaffy;
 use crate::{
-    AnyElement, App, Axis, Bounds, Corner, Display, Edges, Element, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Point, Position, Size, Style,
-    Window, point, px,
+    AnyElement, App, Axis, Bounds, Corner, Display, Edges, ElementImpl,
+    IntoElement, ParentElement, Pixels, Point, Position, Size, Style, UpdateResult, Window,
+    point, px,
 };
-
-/// The state that the anchored element element uses to track its children.
-pub struct AnchoredState {
-    child_layout_ids: SmallVec<[LayoutId; 4]>,
-}
 
 /// An anchored element that can be used to display UI that
 /// will avoid overflowing the window bounds.
+#[derive(Element)]
+#[element(crate = crate)]
 pub struct Anchored {
     children: SmallVec<[AnyElement; 2]>,
     anchor_corner: Corner,
@@ -75,6 +77,16 @@ impl Anchored {
         self.fit_mode = AnchoredFitMode::SnapToWindowWithMargin(edges.into());
         self
     }
+
+    pub(crate) fn config(&self) -> AnchoredConfig {
+        AnchoredConfig {
+            anchor_corner: self.anchor_corner,
+            fit_mode: self.fit_mode,
+            anchor_position: self.anchor_position,
+            position_mode: self.position_mode,
+            offset: self.offset,
+        }
+    }
 }
 
 impl ParentElement for Anchored {
@@ -83,151 +95,40 @@ impl ParentElement for Anchored {
     }
 }
 
-impl Element for Anchored {
-    type RequestLayoutState = AnchoredState;
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<crate::ElementId> {
-        None
+impl ElementImpl for Anchored {
+    fn children(&self) -> &[AnyElement] {
+        &self.children
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
+    fn children_mut(&mut self) -> &mut [AnyElement] {
+        &mut self.children
     }
 
-    fn request_layout(
+    fn create_render_node(&mut self) -> Option<Box<dyn crate::RenderNode>> {
+        Some(Box::new(AnchoredNode::new(self.config())))
+    }
+
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<AnchoredNode>())
+    }
+
+    fn update_render_node(
         &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (crate::LayoutId, Self::RequestLayoutState) {
-        let child_layout_ids = self
-            .children
-            .iter_mut()
-            .map(|child| child.request_layout(window, cx))
-            .collect::<SmallVec<_>>();
-
-        let anchored_style = Style {
-            position: Position::Absolute,
-            display: Display::Flex,
-            ..Style::default()
-        };
-
-        let layout_id = window.request_layout(anchored_style, child_layout_ids.iter().copied(), cx);
-
-        (layout_id, AnchoredState { child_layout_ids })
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        if request_layout.child_layout_ids.is_empty() {
-            return;
-        }
-
-        let mut child_min = point(Pixels::MAX, Pixels::MAX);
-        let mut child_max = Point::default();
-        for child_layout_id in &request_layout.child_layout_ids {
-            let child_bounds = window.layout_bounds(*child_layout_id);
-            child_min = child_min.min(&child_bounds.origin);
-            child_max = child_max.max(&child_bounds.bottom_right());
-        }
-        let size: Size<Pixels> = (child_max - child_min).into();
-
-        let (origin, mut desired) = self.position_mode.get_position_and_bounds(
-            self.anchor_position,
-            self.anchor_corner,
-            size,
-            bounds,
-            self.offset,
-        );
-
-        let limits = Bounds {
-            origin: Point::default(),
-            size: window.viewport_size(),
-        };
-
-        if self.fit_mode == AnchoredFitMode::SwitchAnchor {
-            let mut anchor_corner = self.anchor_corner;
-
-            if desired.left() < limits.left() || desired.right() > limits.right() {
-                let switched = Bounds::from_corner_and_size(
-                    anchor_corner.other_side_corner_along(Axis::Horizontal),
-                    origin,
-                    size,
-                );
-                if !(switched.left() < limits.left() || switched.right() > limits.right()) {
-                    anchor_corner = anchor_corner.other_side_corner_along(Axis::Horizontal);
-                    desired = switched
-                }
-            }
-
-            if desired.top() < limits.top() || desired.bottom() > limits.bottom() {
-                let switched = Bounds::from_corner_and_size(
-                    anchor_corner.other_side_corner_along(Axis::Vertical),
-                    origin,
-                    size,
-                );
-                if !(switched.top() < limits.top() || switched.bottom() > limits.bottom()) {
-                    desired = switched;
-                }
-            }
-        }
-
-        let client_inset = window.client_inset.unwrap_or(px(0.));
-        let edges = match self.fit_mode {
-            AnchoredFitMode::SnapToWindowWithMargin(edges) => edges,
-            _ => Edges::default(),
-        }
-        .map(|edge| *edge + client_inset);
-
-        // Snap the horizontal edges of the anchored element to the horizontal edges of the window if
-        // its horizontal bounds overflow, aligning to the left if it is wider than the limits.
-        if desired.right() > limits.right() {
-            desired.origin.x -= desired.right() - limits.right() + edges.right;
-        }
-        if desired.left() < limits.left() {
-            desired.origin.x = limits.origin.x + edges.left;
-        }
-
-        // Snap the vertical edges of the anchored element to the vertical edges of the window if
-        // its vertical bounds overflow, aligning to the top if it is taller than the limits.
-        if desired.bottom() > limits.bottom() {
-            desired.origin.y -= desired.bottom() - limits.bottom() + edges.bottom;
-        }
-        if desired.top() < limits.top() {
-            desired.origin.y = limits.origin.y + edges.top;
-        }
-
-        let offset = desired.origin - bounds.origin;
-        let offset = point(offset.x.round(), offset.y.round());
-
-        window.with_element_offset(offset, |window| {
-            for child in &mut self.children {
-                child.prepaint(window, cx);
-            }
-        })
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: crate::Bounds<crate::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        for child in &mut self.children {
-            child.paint(window, cx);
+        node: &mut dyn crate::RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        if let Some(anchored_node) = node.as_any_mut().downcast_mut::<AnchoredNode>() {
+            let config = self.config();
+            let update_result = if anchored_node.config != config {
+                UpdateResult::LAYOUT_CHANGED
+            } else {
+                UpdateResult::UNCHANGED
+            };
+            anchored_node.update_from(config);
+            Some(update_result)
+        } else {
+            None
         }
     }
 }
@@ -241,7 +142,7 @@ impl IntoElement for Anchored {
 }
 
 /// Which algorithm to use when fitting the anchored element to be inside the window.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum AnchoredFitMode {
     /// Snap the anchored element to the window edge.
     SnapToWindow,
@@ -252,7 +153,7 @@ pub enum AnchoredFitMode {
 }
 
 /// Which algorithm to use when positioning the anchored element.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum AnchoredPositionMode {
     /// Position the anchored element relative to the window.
     Window,
@@ -261,7 +162,7 @@ pub enum AnchoredPositionMode {
 }
 
 impl AnchoredPositionMode {
-    fn get_position_and_bounds(
+    pub(crate) fn get_position_and_bounds(
         &self,
         anchor_position: Option<Point<Pixels>>,
         anchor_corner: Corner,
@@ -289,4 +190,197 @@ impl AnchoredPositionMode {
             }
         }
     }
+}
+
+/// Retained render node for Anchored elements.
+pub(crate) struct AnchoredNode {
+    config: AnchoredConfig,
+}
+
+impl AnchoredNode {
+    pub fn new(config: AnchoredConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn update_from(&mut self, config: AnchoredConfig) {
+        self.config = config;
+    }
+
+    fn compute_offset(
+        &self,
+        bounds: Bounds<Pixels>,
+        child_bounds: &[Bounds<Pixels>],
+        window: &Window,
+    ) -> Option<Point<Pixels>> {
+        if child_bounds.is_empty() {
+            return None;
+        }
+
+        let mut child_min = point(Pixels::MAX, Pixels::MAX);
+        let mut child_max = Point::default();
+        for cb in child_bounds {
+            child_min = child_min.min(&cb.origin);
+            child_max = child_max.max(&cb.bottom_right());
+        }
+        let size: Size<Pixels> = (child_max - child_min).into();
+
+        let (origin, mut desired) = self.config.position_mode.get_position_and_bounds(
+            self.config.anchor_position,
+            self.config.anchor_corner,
+            size,
+            bounds,
+            self.config.offset,
+        );
+
+        let limits = Bounds {
+            origin: Point::default(),
+            size: window.viewport_size(),
+        };
+
+        if self.config.fit_mode == AnchoredFitMode::SwitchAnchor {
+            let mut anchor_corner = self.config.anchor_corner;
+
+            if desired.left() < limits.left() || desired.right() > limits.right() {
+                let switched = Bounds::from_corner_and_size(
+                    anchor_corner.other_side_corner_along(Axis::Horizontal),
+                    origin,
+                    size,
+                );
+                if !(switched.left() < limits.left() || switched.right() > limits.right()) {
+                    anchor_corner = anchor_corner.other_side_corner_along(Axis::Horizontal);
+                    desired = switched
+                }
+            }
+
+            if desired.top() < limits.top() || desired.bottom() > limits.bottom() {
+                let switched = Bounds::from_corner_and_size(
+                    anchor_corner.other_side_corner_along(Axis::Vertical),
+                    origin,
+                    size,
+                );
+                if !(switched.top() < limits.top() || switched.bottom() > limits.bottom()) {
+                    desired = switched;
+                }
+            }
+        }
+
+        let client_inset = window.client_inset.unwrap_or(px(0.));
+        let edges = match self.config.fit_mode {
+            AnchoredFitMode::SnapToWindowWithMargin(edges) => edges,
+            _ => Edges::default(),
+        }
+        .map(|edge| *edge + client_inset);
+
+        if desired.right() > limits.right() {
+            desired.origin.x -= desired.right() - limits.right() + edges.right;
+        }
+        if desired.left() < limits.left() {
+            desired.origin.x = limits.origin.x + edges.left;
+        }
+
+        if desired.bottom() > limits.bottom() {
+            desired.origin.y -= desired.bottom() - limits.bottom() + edges.bottom;
+        }
+        if desired.top() < limits.top() {
+            desired.origin.y = limits.origin.y + edges.top;
+        }
+
+        let offset = desired.origin - bounds.origin;
+        let offset = point(offset.x.round(), offset.y.round());
+        if offset.is_zero() { None } else { Some(offset) }
+    }
+}
+
+impl crate::RenderNode for AnchoredNode {
+    fn taffy_style(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::Style {
+        let anchored_style = Style {
+            position: Position::Absolute,
+            display: Display::Flex,
+            ..Style::default()
+        };
+        anchored_style.to_taffy(rem_size, scale_factor)
+    }
+
+    fn compute_intrinsic_size(
+        &mut self,
+        _ctx: &mut crate::SizingCtx,
+    ) -> crate::IntrinsicSizeResult {
+        crate::IntrinsicSizeResult {
+            size: crate::IntrinsicSize::default(),
+            input: crate::SizingInput::default(),
+        }
+    }
+
+    fn layout_begin(&mut self, _ctx: &mut crate::LayoutCtx) -> crate::LayoutFrame {
+        crate::LayoutFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_begin(&mut self, ctx: &mut crate::PrepaintCtx) -> crate::PrepaintFrame {
+        if let Some(offset) = self.compute_offset(ctx.bounds, &ctx.child_bounds, ctx.window) {
+            ctx.window.transform_stack.push_offset(offset);
+            crate::PrepaintFrame {
+                handled: true,
+                skip_children: false,
+                pushed_element_offset: true,
+                ..Default::default()
+            }
+        } else if ctx.child_bounds.is_empty() {
+            crate::PrepaintFrame {
+                handled: true,
+                skip_children: true,
+                ..Default::default()
+            }
+        } else {
+            crate::PrepaintFrame {
+                handled: true,
+                skip_children: false,
+                ..Default::default()
+            }
+        }
+    }
+
+    fn prepaint_end(&mut self, ctx: &mut crate::PrepaintCtx, frame: crate::PrepaintFrame) {
+        if frame.pushed_element_offset {
+            if let Some(offset) = self.compute_offset(ctx.bounds, &ctx.child_bounds, ctx.window) {
+                ctx.window.transform_stack.pop_offset(offset);
+            }
+        }
+    }
+
+    fn paint_begin(&mut self, ctx: &mut crate::PaintCtx) -> crate::PaintFrame {
+        if let Some(offset) = self.compute_offset(ctx.bounds, &ctx.child_bounds, ctx.window) {
+            ctx.window.transform_stack.push_offset(offset);
+            crate::PaintFrame {
+                handled: true,
+                skip_children: false,
+                pushed_element_offset: true,
+                ..Default::default()
+            }
+        } else if ctx.child_bounds.is_empty() {
+            crate::PaintFrame {
+                handled: true,
+                skip_children: true,
+                ..Default::default()
+            }
+        } else {
+            crate::PaintFrame {
+                handled: true,
+                skip_children: false,
+                ..Default::default()
+            }
+        }
+    }
+
+    fn paint_end(&mut self, ctx: &mut crate::PaintCtx, frame: crate::PaintFrame) {
+        if frame.pushed_element_offset {
+            if let Some(offset) = self.compute_offset(ctx.bounds, &ctx.child_bounds, ctx.window) {
+                ctx.window.transform_stack.pop_offset(offset);
+            }
+        }
+    }
+
+    // Uses default downcasting implementations.
 }

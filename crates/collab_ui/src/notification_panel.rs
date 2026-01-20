@@ -8,7 +8,7 @@ use futures::StreamExt;
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, Element, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ListAlignment,
-    ListScrollEvent, ListState, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
+    ListScrollEvent, ListState, ParentElement, Render, Styled, Task,
     WeakEntity, Window, actions, div, img, list, px,
 };
 use notifications::{NotificationEntry, NotificationEvent, NotificationStore};

@@ -9,7 +9,7 @@ use editor::Editor;
 use gpui::{
     Action, AnyElement, ClickEvent, ClipboardItem, Context, DismissEvent, Empty, Entity,
     FocusHandle, Focusable, Hsla, MouseDownEvent, Point, Subscription, TextStyleRefinement,
-    UniformListScrollHandle, WeakEntity, actions, anchored, deferred, uniform_list,
+    UniformListScrollHandle, WeakEntity, actions, anchored, uniform_list,
 };
 use itertools::Itertools;
 use menu::{SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -1571,13 +1571,11 @@ impl Render for VariableList {
                 .flex_grow(),
             )
             .children(self.open_context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Corner::TopLeft)
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
+                anchored()
+                    .position(*position)
+                    .anchor(gpui::Corner::TopLeft)
+                    .child(menu.clone())
+                    .z_index(1)
             }))
             // .vertical_scrollbar_for(&self.list_handle, window, cx)
             .custom_scrollbars(

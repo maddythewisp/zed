@@ -12,7 +12,6 @@ use futures::{FutureExt, channel::oneshot, future::Shared, select};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, PromptLevel, ScrollHandle, Subscription, Task, WeakEntity, Window,
-    canvas,
 };
 use language::Point;
 use log::info;
@@ -2591,7 +2590,7 @@ impl RemoteServerProjects {
                 }
             }
         }
-        let mut modal_section = modal_section.render(window, cx).into_any_element();
+        let modal_section = modal_section.render(window, cx).into_any_element();
 
         let (create_window, reuse_window) = if self.create_new_window {
             (
@@ -2625,23 +2624,7 @@ impl RemoteServerProjects {
                         .size_full()
                         .relative()
                         .child(ListSeparator)
-                        .child(
-                            canvas(
-                                |bounds, window, cx| {
-                                    modal_section.prepaint_as_root(
-                                        bounds.origin,
-                                        bounds.size.into(),
-                                        window,
-                                        cx,
-                                    );
-                                    modal_section
-                                },
-                                |_, mut modal_section, window, cx| {
-                                    modal_section.paint(window, cx);
-                                },
-                            )
-                            .size_full(),
-                        )
+                        .child(modal_section)
                         .vertical_scrollbar_for(&state.scroll_handle, window, cx),
                 ),
             )

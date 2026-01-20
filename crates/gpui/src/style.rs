@@ -7,11 +7,11 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, quad, rems, size,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, GridPlacement, Hsla, Length,
+    LinearColorStop, Pixels, Point, PointRefinement, Rems, Rgba, SharedString, Size,
+    SizeRefinement, Styled, TextRun, Window, black, phi, point, quad, rems, size,
 };
-use collections::HashSet;
+use collections::{FxHasher, HashSet};
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,10 +26,12 @@ pub struct DebugBelow;
 impl crate::Global for DebugBelow {}
 
 /// How to fit the image into the bounds of the element.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ObjectFit {
     /// The image will be stretched to fill the bounds of the element.
     Fill,
     /// The image will be scaled to fit within the bounds of the element.
+    #[default]
     Contain,
     /// The image will be scaled to cover the bounds of the element.
     Cover,
@@ -296,6 +298,496 @@ impl StyleRefinement {
     pub fn grid_location_mut(&mut self) -> &mut GridLocation {
         self.grid_location.get_or_insert_default()
     }
+
+    /// Returns whether the sizing-affecting portions of this style refinement match `other`.
+    ///
+    /// This is used to decide whether intrinsic sizing must be recomputed.
+    pub fn sizing_eq(&self, other: &StyleRefinement) -> bool {
+        self.display == other.display
+            && self.overflow == other.overflow
+            && self.scrollbar_width == other.scrollbar_width
+            && self.allow_concurrent_scroll == other.allow_concurrent_scroll
+            && self.restrict_scroll_to_axis == other.restrict_scroll_to_axis
+            && self.size == other.size
+            && self.min_size == other.min_size
+            && self.max_size == other.max_size
+            && self
+                .aspect_ratio
+                .map(f32::to_bits)
+                .eq(&other.aspect_ratio.map(f32::to_bits))
+            && self.padding == other.padding
+            && self.border_widths == other.border_widths
+            && self.align_items == other.align_items
+            && self.align_content == other.align_content
+            && self.justify_content == other.justify_content
+            && self.gap == other.gap
+            && self.flex_direction == other.flex_direction
+            && self.flex_wrap == other.flex_wrap
+            && self.flex_basis == other.flex_basis
+            && self
+                .flex_grow
+                .map(f32::to_bits)
+                .eq(&other.flex_grow.map(f32::to_bits))
+            && self
+                .flex_shrink
+                .map(f32::to_bits)
+                .eq(&other.flex_shrink.map(f32::to_bits))
+            && self.text.layout_eq(&other.text)
+            && self.grid_cols == other.grid_cols
+            && self.grid_cols_min_content == other.grid_cols_min_content
+            && self.grid_rows == other.grid_rows
+            && {
+                #[cfg(debug_assertions)]
+                {
+                    self.debug == other.debug && self.debug_below == other.debug_below
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    true
+                }
+            }
+    }
+
+    /// Returns whether the position-affecting portions of this style refinement match `other`.
+    ///
+    /// These changes don't affect intrinsic sizing, but do require re-layout.
+    pub fn position_eq(&self, other: &StyleRefinement) -> bool {
+        self.position == other.position
+            && self.inset == other.inset
+            && self.margin == other.margin
+            && self.align_self == other.align_self
+            && self.grid_location == other.grid_location
+    }
+
+    /// Returns whether the layout-affecting portions of this style refinement match `other`.
+    pub fn layout_eq(&self, other: &StyleRefinement) -> bool {
+        self.display == other.display
+            && self.overflow == other.overflow
+            && self.scrollbar_width == other.scrollbar_width
+            && self.allow_concurrent_scroll == other.allow_concurrent_scroll
+            && self.restrict_scroll_to_axis == other.restrict_scroll_to_axis
+            && self.position == other.position
+            && self.inset == other.inset
+            && self.size == other.size
+            && self.min_size == other.min_size
+            && self.max_size == other.max_size
+            && self
+                .aspect_ratio
+                .map(f32::to_bits)
+                .eq(&other.aspect_ratio.map(f32::to_bits))
+            && self.margin == other.margin
+            && self.padding == other.padding
+            && self.border_widths == other.border_widths
+            && self.align_items == other.align_items
+            && self.align_self == other.align_self
+            && self.align_content == other.align_content
+            && self.justify_content == other.justify_content
+            && self.gap == other.gap
+            && self.flex_direction == other.flex_direction
+            && self.flex_wrap == other.flex_wrap
+            && self.flex_basis == other.flex_basis
+            && self
+                .flex_grow
+                .map(f32::to_bits)
+                .eq(&other.flex_grow.map(f32::to_bits))
+            && self
+                .flex_shrink
+                .map(f32::to_bits)
+                .eq(&other.flex_shrink.map(f32::to_bits))
+            && self.text.layout_eq(&other.text)
+            && self.grid_cols == other.grid_cols
+            && self.grid_cols_min_content == other.grid_cols_min_content
+            && self.grid_rows == other.grid_rows
+            && self.grid_location == other.grid_location
+            && {
+                #[cfg(debug_assertions)]
+                {
+                    self.debug == other.debug && self.debug_below == other.debug_below
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    true
+                }
+            }
+    }
+
+    /// Returns whether the paint-affecting portions of this style refinement match `other`.
+    pub fn paint_eq(&self, other: &StyleRefinement) -> bool {
+        self.visibility == other.visibility
+            && self.background == other.background
+            && self.border_color == other.border_color
+            && self.border_style == other.border_style
+            && self.corner_radii == other.corner_radii
+            && self.box_shadow == other.box_shadow
+            && self.text.paint_eq(&other.text)
+            && self.mouse_cursor == other.mouse_cursor
+            && self
+                .opacity
+                .map(f32::to_bits)
+                .eq(&other.opacity.map(f32::to_bits))
+            && {
+                #[cfg(debug_assertions)]
+                {
+                    self.debug == other.debug && self.debug_below == other.debug_below
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    true
+                }
+            }
+    }
+
+    /// Hash layout and paint-affecting style refinements for change detection.
+    pub fn layout_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+
+        hash_option_enum(&mut hasher, &self.display);
+        hash_point_refinement(&mut hasher, &self.overflow, |state, value| {
+            hash_enum(state, value)
+        });
+        hash_option_with(&mut hasher, &self.scrollbar_width, |state, value| {
+            hash_absolute_length(state, value);
+        });
+        hash_option(&mut hasher, &self.allow_concurrent_scroll);
+        hash_option(&mut hasher, &self.restrict_scroll_to_axis);
+        hash_option_enum(&mut hasher, &self.position);
+        hash_edges_refinement(&mut hasher, &self.inset, |state, value| {
+            hash_length(state, value);
+        });
+        hash_size_refinement(&mut hasher, &self.size, |state, value| {
+            hash_length(state, value);
+        });
+        hash_size_refinement(&mut hasher, &self.min_size, |state, value| {
+            hash_length(state, value);
+        });
+        hash_size_refinement(&mut hasher, &self.max_size, |state, value| {
+            hash_length(state, value);
+        });
+        hash_option_with(&mut hasher, &self.aspect_ratio, |state, value| {
+            hash_f32(state, *value);
+        });
+        hash_edges_refinement(&mut hasher, &self.margin, |state, value| {
+            hash_length(state, value);
+        });
+        hash_edges_refinement(&mut hasher, &self.padding, |state, value| {
+            hash_definite_length(state, value);
+        });
+        hash_edges_refinement(&mut hasher, &self.border_widths, |state, value| {
+            hash_absolute_length(state, value);
+        });
+
+        hash_option_enum(&mut hasher, &self.align_items);
+        hash_option_enum(&mut hasher, &self.align_self);
+        hash_option_enum(&mut hasher, &self.align_content);
+        hash_option_enum(&mut hasher, &self.justify_content);
+        hash_size_refinement(&mut hasher, &self.gap, |state, value| {
+            hash_definite_length(state, value);
+        });
+
+        hash_option_enum(&mut hasher, &self.flex_direction);
+        hash_option_enum(&mut hasher, &self.flex_wrap);
+        hash_option_with(&mut hasher, &self.flex_basis, |state, value| {
+            hash_length(state, value);
+        });
+        hash_option_with(&mut hasher, &self.flex_grow, |state, value| {
+            hash_f32(state, *value);
+        });
+        hash_option_with(&mut hasher, &self.flex_shrink, |state, value| {
+            hash_f32(state, *value);
+        });
+
+        self.text.layout_hash().hash(&mut hasher);
+        hash_option(&mut hasher, &self.grid_cols);
+        hash_option(&mut hasher, &self.grid_cols_min_content);
+        hash_option(&mut hasher, &self.grid_rows);
+        hash_option_with(&mut hasher, &self.grid_location, |state, value| {
+            hash_grid_location(state, value);
+        });
+
+        hasher.finish()
+    }
+
+    /// Hash paint-affecting style refinements for change detection.
+    pub fn paint_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+
+        hash_option_enum(&mut hasher, &self.visibility);
+        hash_option_with(&mut hasher, &self.background, |state, value| {
+            hash_fill(state, value);
+        });
+        hash_option(&mut hasher, &self.border_color);
+        hash_option_enum(&mut hasher, &self.border_style);
+        hash_corners_refinement(&mut hasher, &self.corner_radii, |state, value| {
+            hash_absolute_length(state, value);
+        });
+        hash_box_shadows(&mut hasher, &self.box_shadow);
+
+        self.text.paint_hash().hash(&mut hasher);
+
+        hash_option(&mut hasher, &self.mouse_cursor);
+        hash_option_with(&mut hasher, &self.opacity, |state, value| {
+            hash_f32(state, *value);
+        });
+
+        #[cfg(debug_assertions)]
+        {
+            hash_option(&mut hasher, &self.debug);
+            hash_option(&mut hasher, &self.debug_below);
+        }
+
+        hasher.finish()
+    }
+}
+
+fn hash_option_with<H, T>(state: &mut H, value: &Option<T>, hash_value: impl Fn(&mut H, &T))
+where
+    H: Hasher,
+{
+    match value {
+        Some(value) => {
+            state.write_u8(1);
+            hash_value(state, value);
+        }
+        None => state.write_u8(0),
+    }
+}
+
+fn hash_enum<H: Hasher, T>(state: &mut H, value: &T) {
+    std::mem::discriminant(value).hash(state);
+}
+
+fn hash_option<H: Hasher, T: Hash>(state: &mut H, value: &Option<T>) {
+    match value {
+        Some(v) => {
+            state.write_u8(1);
+            v.hash(state);
+        }
+        None => state.write_u8(0),
+    }
+}
+
+fn hash_option_enum<H: Hasher, T>(state: &mut H, value: &Option<T>) {
+    hash_option_with(state, value, |s, v| hash_enum(s, v));
+}
+
+fn hash_f32<H: Hasher>(state: &mut H, value: f32) {
+    state.write_u32(value.to_bits());
+}
+
+fn hash_absolute_length<H: Hasher>(state: &mut H, value: &AbsoluteLength) {
+    match value {
+        AbsoluteLength::Pixels(pixels) => {
+            state.write_u8(0);
+            pixels.hash(state);
+        }
+        AbsoluteLength::Rems(rems) => {
+            state.write_u8(1);
+            hash_rems(state, *rems);
+        }
+    }
+}
+
+fn hash_definite_length<H: Hasher>(state: &mut H, value: &DefiniteLength) {
+    match value {
+        DefiniteLength::Absolute(length) => {
+            state.write_u8(0);
+            hash_absolute_length(state, length);
+        }
+        DefiniteLength::Fraction(fraction) => {
+            state.write_u8(1);
+            hash_f32(state, *fraction);
+        }
+    }
+}
+
+fn hash_length<H: Hasher>(state: &mut H, value: &Length) {
+    match value {
+        Length::Definite(length) => {
+            state.write_u8(0);
+            hash_definite_length(state, length);
+        }
+        Length::Auto => state.write_u8(1),
+    }
+}
+
+fn hash_rems<H: Hasher>(state: &mut H, value: Rems) {
+    hash_f32(state, value.0);
+}
+
+fn hash_point<H, T>(state: &mut H, point: &Point<T>, hash_value: impl Fn(&mut H, &T))
+where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_value(state, &point.x);
+    hash_value(state, &point.y);
+}
+
+fn hash_point_refinement<H, T>(
+    state: &mut H,
+    point: &PointRefinement<T>,
+    hash_value: impl Fn(&mut H, &T),
+) where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_option_with(state, &point.x, &hash_value);
+    hash_option_with(state, &point.y, &hash_value);
+}
+
+fn hash_edges<H, T>(state: &mut H, edges: &Edges<T>, hash_value: impl Fn(&mut H, &T))
+where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_value(state, &edges.top);
+    hash_value(state, &edges.right);
+    hash_value(state, &edges.bottom);
+    hash_value(state, &edges.left);
+}
+
+fn hash_edges_refinement<H, T>(
+    state: &mut H,
+    edges: &EdgesRefinement<T>,
+    hash_value: impl Fn(&mut H, &T),
+) where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_option_with(state, &edges.top, &hash_value);
+    hash_option_with(state, &edges.right, &hash_value);
+    hash_option_with(state, &edges.bottom, &hash_value);
+    hash_option_with(state, &edges.left, &hash_value);
+}
+
+fn hash_size<H, T>(state: &mut H, size: &Size<T>, hash_value: impl Fn(&mut H, &T))
+where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_value(state, &size.width);
+    hash_value(state, &size.height);
+}
+
+fn hash_size_refinement<H, T>(
+    state: &mut H,
+    size: &SizeRefinement<T>,
+    hash_value: impl Fn(&mut H, &T),
+) where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_option_with(state, &size.width, &hash_value);
+    hash_option_with(state, &size.height, &hash_value);
+}
+
+fn hash_corners<H, T>(state: &mut H, corners: &Corners<T>, hash_value: impl Fn(&mut H, &T))
+where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_value(state, &corners.top_left);
+    hash_value(state, &corners.top_right);
+    hash_value(state, &corners.bottom_right);
+    hash_value(state, &corners.bottom_left);
+}
+
+fn hash_corners_refinement<H, T>(
+    state: &mut H,
+    corners: &CornersRefinement<T>,
+    hash_value: impl Fn(&mut H, &T),
+) where
+    H: Hasher,
+    T: Clone + std::fmt::Debug + Default + PartialEq,
+{
+    hash_option_with(state, &corners.top_left, &hash_value);
+    hash_option_with(state, &corners.top_right, &hash_value);
+    hash_option_with(state, &corners.bottom_right, &hash_value);
+    hash_option_with(state, &corners.bottom_left, &hash_value);
+}
+
+fn hash_fill<H: Hasher>(state: &mut H, value: &Fill) {
+    match value {
+        Fill::Color(background) => {
+            state.write_u8(0);
+            hash_background(state, background);
+        }
+    }
+}
+
+fn hash_background<H: Hasher>(state: &mut H, background: &Background) {
+    hash_enum(state, &background.tag);
+    hash_enum(state, &background.color_space);
+    background.solid.hash(state);
+    hash_f32(state, background.gradient_angle_or_pattern_height);
+
+    let stop_count = background.colors.len();
+    for stop in &background.colors[..stop_count] {
+        hash_linear_color_stop(state, stop);
+    }
+}
+
+fn hash_linear_color_stop<H: Hasher>(state: &mut H, stop: &LinearColorStop) {
+    stop.color.hash(state);
+    hash_f32(state, stop.percentage);
+}
+
+fn hash_box_shadows<H: Hasher>(state: &mut H, value: &Option<Vec<BoxShadow>>) {
+    match value {
+        Some(shadows) => {
+            state.write_u8(1);
+            hash_box_shadow_list(state, shadows);
+        }
+        None => state.write_u8(0),
+    }
+}
+
+fn hash_box_shadow_list<H: Hasher>(state: &mut H, shadows: &[BoxShadow]) {
+    shadows.len().hash(state);
+    for shadow in shadows {
+        hash_box_shadow(state, shadow);
+    }
+}
+
+fn hash_box_shadow<H: Hasher>(state: &mut H, value: &BoxShadow) {
+    value.color.hash(state);
+    value.offset.hash(state);
+    value.blur_radius.hash(state);
+    value.spread_radius.hash(state);
+}
+
+fn hash_grid_location<H: Hasher>(state: &mut H, value: &GridLocation) {
+    hash_grid_placement(state, &value.row.start);
+    hash_grid_placement(state, &value.row.end);
+    hash_grid_placement(state, &value.column.start);
+    hash_grid_placement(state, &value.column.end);
+}
+
+fn hash_grid_placement<H: Hasher>(state: &mut H, value: &GridPlacement) {
+    match value {
+        GridPlacement::Line(index) => {
+            state.write_u8(0);
+            index.hash(state);
+        }
+        GridPlacement::Span(span) => {
+            state.write_u8(1);
+            span.hash(state);
+        }
+        GridPlacement::Auto => state.write_u8(2),
+    }
+}
+
+fn hash_text_overflow<H: Hasher>(state: &mut H, value: &TextOverflow) {
+    match value {
+        TextOverflow::Truncate(text) => {
+            state.write_u8(0);
+            text.hash(state);
+        }
+        TextOverflow::TruncateStart(text) => {
+            state.write_u8(1);
+            text.hash(state);
+        }
+    }
 }
 
 /// The value of the visibility property, similar to the CSS property `visibility`
@@ -499,6 +991,68 @@ impl TextStyle {
     }
 }
 
+impl TextStyleRefinement {
+    /// Returns whether the layout-affecting portions of this text style refinement match `other`.
+    pub fn layout_eq(&self, other: &TextStyleRefinement) -> bool {
+        self.font_family == other.font_family
+            && self.font_features == other.font_features
+            && self.font_fallbacks == other.font_fallbacks
+            && self.font_size == other.font_size
+            && self.line_height == other.line_height
+            && self.font_weight == other.font_weight
+            && self.font_style == other.font_style
+            && self.white_space == other.white_space
+            && self.text_overflow == other.text_overflow
+            && self.text_align == other.text_align
+            && self.line_clamp == other.line_clamp
+    }
+
+    /// Returns whether the paint-affecting portions of this text style refinement match `other`.
+    pub fn paint_eq(&self, other: &TextStyleRefinement) -> bool {
+        self.color == other.color
+            && self.background_color == other.background_color
+            && self.underline == other.underline
+            && self.strikethrough == other.strikethrough
+    }
+
+    /// Hash text style refinements for change detection.
+    pub fn layout_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+
+        hash_option(&mut hasher, &self.font_family);
+        hash_option(&mut hasher, &self.font_features);
+        hash_option(&mut hasher, &self.font_fallbacks);
+        hash_option_with(&mut hasher, &self.font_size, |state, value| {
+            hash_absolute_length(state, value);
+        });
+        hash_option_with(&mut hasher, &self.line_height, |state, value| {
+            hash_definite_length(state, value);
+        });
+        hash_option(&mut hasher, &self.font_weight);
+        hash_option(&mut hasher, &self.font_style);
+        hash_option_enum(&mut hasher, &self.white_space);
+        hash_option_with(&mut hasher, &self.text_overflow, |state, value| {
+            hash_text_overflow(state, value);
+        });
+        hash_option_enum(&mut hasher, &self.text_align);
+        hash_option(&mut hasher, &self.line_clamp);
+
+        hasher.finish()
+    }
+
+    /// Hash paint-affecting text style refinements for change detection.
+    pub fn paint_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+
+        hash_option(&mut hasher, &self.color);
+        hash_option(&mut hasher, &self.background_color);
+        hash_option(&mut hasher, &self.underline);
+        hash_option(&mut hasher, &self.strikethrough);
+
+        hasher.finish()
+    }
+}
+
 /// A highlight style to apply, similar to a `TextStyle` except
 /// for a single font, uniformly sized and spaced text.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -547,6 +1101,177 @@ impl Style {
         self.background
             .as_ref()
             .is_some_and(|fill| fill.color().is_some_and(|color| !color.is_transparent()))
+    }
+
+    /// Returns whether the layout-affecting portions of this style match `other`.
+    pub fn layout_eq(&self, other: &Style) -> bool {
+        self.display == other.display
+            && self.overflow == other.overflow
+            && self.scrollbar_width == other.scrollbar_width
+            && self.allow_concurrent_scroll == other.allow_concurrent_scroll
+            && self.restrict_scroll_to_axis == other.restrict_scroll_to_axis
+            && self.position == other.position
+            && self.inset == other.inset
+            && self.size == other.size
+            && self.min_size == other.min_size
+            && self.max_size == other.max_size
+            && self
+                .aspect_ratio
+                .map(f32::to_bits)
+                .eq(&other.aspect_ratio.map(f32::to_bits))
+            && self.margin == other.margin
+            && self.padding == other.padding
+            && self.border_widths == other.border_widths
+            && self.align_items == other.align_items
+            && self.align_self == other.align_self
+            && self.align_content == other.align_content
+            && self.justify_content == other.justify_content
+            && self.gap == other.gap
+            && self.flex_direction == other.flex_direction
+            && self.flex_wrap == other.flex_wrap
+            && self.flex_basis == other.flex_basis
+            && self.flex_grow.to_bits() == other.flex_grow.to_bits()
+            && self.flex_shrink.to_bits() == other.flex_shrink.to_bits()
+            && self.text.layout_eq(&other.text)
+            && self.grid_cols == other.grid_cols
+            && self.grid_cols_min_content == other.grid_cols_min_content
+            && self.grid_rows == other.grid_rows
+            && self.grid_location == other.grid_location
+            && {
+                #[cfg(debug_assertions)]
+                {
+                    self.debug == other.debug && self.debug_below == other.debug_below
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    true
+                }
+            }
+    }
+
+    /// Returns whether the paint-affecting portions of this style match `other`.
+    pub fn paint_eq(&self, other: &Style) -> bool {
+        self.visibility == other.visibility
+            && self.background == other.background
+            && self.border_color == other.border_color
+            && self.border_style == other.border_style
+            && self.corner_radii == other.corner_radii
+            && self.box_shadow == other.box_shadow
+            && self.text.paint_eq(&other.text)
+            && self.mouse_cursor == other.mouse_cursor
+            && self
+                .opacity
+                .map(f32::to_bits)
+                .eq(&other.opacity.map(f32::to_bits))
+            && {
+                #[cfg(debug_assertions)]
+                {
+                    self.debug == other.debug && self.debug_below == other.debug_below
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    true
+                }
+            }
+    }
+
+    /// Hash layout and paint-affecting style values for change detection.
+    pub fn layout_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+
+        hash_enum(&mut hasher, &self.display);
+        hash_point(&mut hasher, &self.overflow, |state, value| {
+            hash_enum(state, value)
+        });
+        hash_absolute_length(&mut hasher, &self.scrollbar_width);
+        self.allow_concurrent_scroll.hash(&mut hasher);
+        self.restrict_scroll_to_axis.hash(&mut hasher);
+        hash_enum(&mut hasher, &self.position);
+        hash_edges(&mut hasher, &self.inset, |state, value| {
+            hash_length(state, value)
+        });
+        hash_size(&mut hasher, &self.size, |state, value| {
+            hash_length(state, value)
+        });
+        hash_size(&mut hasher, &self.min_size, |state, value| {
+            hash_length(state, value)
+        });
+        hash_size(&mut hasher, &self.max_size, |state, value| {
+            hash_length(state, value)
+        });
+        hash_option_with(&mut hasher, &self.aspect_ratio, |state, value| {
+            hash_f32(state, *value);
+        });
+        hash_edges(&mut hasher, &self.margin, |state, value| {
+            hash_length(state, value)
+        });
+        hash_edges(&mut hasher, &self.padding, |state, value| {
+            hash_definite_length(state, value);
+        });
+        hash_edges(&mut hasher, &self.border_widths, |state, value| {
+            hash_absolute_length(state, value);
+        });
+
+        hash_option_enum(&mut hasher, &self.align_items);
+        hash_option_enum(&mut hasher, &self.align_self);
+        hash_option_enum(&mut hasher, &self.align_content);
+        hash_option_enum(&mut hasher, &self.justify_content);
+        hash_size(&mut hasher, &self.gap, |state, value| {
+            hash_definite_length(state, value);
+        });
+
+        hash_enum(&mut hasher, &self.flex_direction);
+        hash_enum(&mut hasher, &self.flex_wrap);
+        hash_length(&mut hasher, &self.flex_basis);
+        hash_f32(&mut hasher, self.flex_grow);
+        hash_f32(&mut hasher, self.flex_shrink);
+
+        self.text.layout_hash().hash(&mut hasher);
+        self.grid_cols.hash(&mut hasher);
+        self.grid_cols_min_content.hash(&mut hasher);
+        self.grid_rows.hash(&mut hasher);
+        hash_option_with(&mut hasher, &self.grid_location, |state, value| {
+            hash_grid_location(state, value);
+        });
+
+        #[cfg(debug_assertions)]
+        {
+            self.debug.hash(&mut hasher);
+            self.debug_below.hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
+
+    /// Hash paint-affecting style values for change detection.
+    pub fn paint_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+
+        hash_enum(&mut hasher, &self.visibility);
+        hash_option_with(&mut hasher, &self.background, |state, value| {
+            hash_fill(state, value);
+        });
+        self.border_color.hash(&mut hasher);
+        hash_enum(&mut hasher, &self.border_style);
+        hash_corners(&mut hasher, &self.corner_radii, |state, value| {
+            hash_absolute_length(state, value);
+        });
+        hash_box_shadow_list(&mut hasher, &self.box_shadow);
+
+        self.text.paint_hash().hash(&mut hasher);
+
+        self.mouse_cursor.hash(&mut hasher);
+        hash_option_with(&mut hasher, &self.opacity, |state, value| {
+            hash_f32(state, *value);
+        });
+
+        #[cfg(debug_assertions)]
+        {
+            self.debug.hash(&mut hasher);
+            self.debug_below.hash(&mut hasher);
+        }
+
+        hasher.finish()
     }
 
     /// Get the text style in this element style.
@@ -617,13 +1342,25 @@ impl Style {
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
+        self.paint_before_children(bounds, window, cx);
+        continuation(window, cx);
+        self.paint_after_children(bounds, window, cx);
+    }
+
+    /// Paint the element background and shadows before drawing children.
+    pub fn paint_before_children(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
         #[cfg(debug_assertions)]
         if self.debug_below {
-            cx.set_global(DebugBelow)
+            _cx.set_global(DebugBelow)
         }
 
         #[cfg(debug_assertions)]
-        if self.debug || cx.has_global::<DebugBelow>() {
+        if self.debug || _cx.has_global::<DebugBelow>() {
             window.paint_quad(crate::outline(bounds, crate::red(), BorderStyle::default()));
         }
 
@@ -636,6 +1373,13 @@ impl Style {
         window.paint_shadows(bounds, corner_radii, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
+        log::trace!(
+            "[PAINT_BEFORE_CHILDREN] bounds={:?}, background={:?}, background_color={:?}, corner_radii={:?}",
+            bounds,
+            self.background,
+            background_color,
+            corner_radii
+        );
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
                 Some(color) => match color.tag {
@@ -659,10 +1403,16 @@ impl Style {
                 self.border_style,
             ));
         }
+    }
 
-        continuation(window, cx);
-
+    /// Paint the element border after drawing children.
+    pub fn paint_after_children(&self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         if self.is_border_visible() {
+            let rem_size = window.rem_size();
+            let corner_radii = self
+                .corner_radii
+                .to_pixels(rem_size)
+                .clamp_radii_for_quad_size(bounds.size);
             let border_widths = self.border_widths.to_pixels(rem_size);
             let max_border_width = border_widths.max();
             let max_corner_radius = corner_radii.max();
@@ -695,38 +1445,19 @@ impl Style {
                 self.border_style,
             );
 
-            window.with_content_mask(Some(ContentMask { bounds: top_bounds }), |window| {
-                window.paint_quad(quad.clone());
-            });
-            window.with_content_mask(
-                Some(ContentMask {
-                    bounds: right_bounds,
-                }),
-                |window| {
-                    window.paint_quad(quad.clone());
-                },
-            );
-            window.with_content_mask(
-                Some(ContentMask {
-                    bounds: bottom_bounds,
-                }),
-                |window| {
-                    window.paint_quad(quad.clone());
-                },
-            );
-            window.with_content_mask(
-                Some(ContentMask {
-                    bounds: left_bounds,
-                }),
-                |window| {
-                    window.paint_quad(quad);
-                },
-            );
-        }
-
-        #[cfg(debug_assertions)]
-        if self.debug_below {
-            cx.remove_global::<DebugBelow>();
+            let masks = [top_bounds, bottom_bounds, left_bounds, right_bounds];
+            let mut paint_cx = crate::window::context::PaintCx::new(window);
+            for mask_bounds in masks {
+                let quad = quad.clone();
+                paint_cx.with_content_mask(
+                    Some(ContentMask {
+                        bounds: mask_bounds,
+                    }),
+                    |window| {
+                        window.paint_quad(quad);
+                    },
+                );
+            }
         }
     }
 

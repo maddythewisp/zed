@@ -58,8 +58,8 @@ impl Render for PaintingViewer {
             canvas(
                 move |_, _, _| {},
                 move |_, _, window, _| {
-                    for (path, color) in lines {
-                        window.paint_path(path, color);
+                    for (path, color) in lines.iter() {
+                        window.paint_path(path.clone(), *color);
                     }
                 },
             )

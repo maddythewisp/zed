@@ -37,7 +37,7 @@ use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Context, DismissEvent, Element, Entity,
     Focusable, KeyBinding, ParentElement, PathPromptOptions, PromptLevel, ReadGlobal, SharedString,
     Task, TitlebarOptions, UpdateGlobal, WeakEntity, Window, WindowHandle, WindowKind,
-    WindowOptions, actions, image_cache, point, px, retain_all,
+    WindowOptions, actions, point, px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -1780,7 +1780,8 @@ fn show_markdown_app_notification<F>(
                 let primary_button_on_click = primary_button_on_click.clone();
                 cx.new(move |cx| {
                     MessageNotification::new_from_builder(cx, move |window, cx| {
-                        image_cache(retain_all("notification-cache"))
+                        div()
+                            .image_cache(retain_all("notification-cache"))
                             .child(div().text_ui(cx).child(
                                 markdown_preview::markdown_renderer::render_parsed_markdown(
                                     &parsed_markdown.clone(),

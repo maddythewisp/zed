@@ -2,7 +2,7 @@ use settings::{Settings, SettingsStore};
 
 use gpui::{
     AnyWindowHandle, Context, Hsla, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    Styled, SystemWindowTab, SystemWindowTabController, Window, WindowId, actions, canvas, div,
+    Styled, SystemWindowTab, SystemWindowTabController, Window, WindowId, actions, div,
 };
 
 use theme::ThemeSettings;
@@ -453,9 +453,10 @@ impl Render for SystemWindowTabs {
                     .track_scroll(&self.tab_bar_scroll_handle)
                     .children(tab_items)
                     .child(
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, _, _, cx| {
+                        div()
+                            .absolute()
+                            .size_full()
+                            .on_layout(move |bounds, _, cx| {
                                 let entity = entity.clone();
                                 entity.update(cx, |this, cx| {
                                     let width = bounds.size.width / number_of_tabs as f32;
@@ -464,10 +465,7 @@ impl Render for SystemWindowTabs {
                                         cx.notify();
                                     }
                                 });
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
+                            }),
                     ),
             )
             .child(

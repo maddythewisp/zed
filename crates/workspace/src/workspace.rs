@@ -46,7 +46,7 @@ use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Bounds, Context,
     CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
+    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Subscription,
     SystemWindowTabController, Task, Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId,
     WindowOptions, actions, canvas, point, relative, size, transparent_black,
 };
@@ -2719,13 +2719,9 @@ impl Workspace {
                                 let focused = window.focused(cx);
                                 window.dispatch_keystroke(keystroke.clone(), cx);
                                 if window.focused(cx) != focused {
-                                    // dispatch_keystroke may cause the focus to change.
-                                    // draw's side effect is to schedule the FocusChanged events in the current flush effect cycle
-                                    // And we need that to happen before the next keystroke to keep vim mode happy...
-                                    // (Note that the tests always do this implicitly, so you must manually test with something like:
-                                    //   "bindings": { "g z": ["workspace::SendKeystrokes", ": j <enter> u"]}
-                                    // )
-                                    window.draw(cx).clear();
+                                    // Dispatch focus change events so subsequent keystrokes
+                                    // see the updated focus state (needed for vim mode).
+                                    window.dispatch_pending_focus_events(cx);
                                 }
                             })
                             .ok();
@@ -7192,8 +7188,10 @@ impl Render for Workspace {
                                 .border_color(colors.border)
                                 .child({
                                     let this = cx.entity();
-                                    canvas(
-                                        move |bounds, window, cx| {
+                                    div()
+                                        .absolute()
+                                        .size_full()
+                                        .on_layout(move |bounds, window, cx| {
                                             this.update(cx, |this, cx| {
                                                 let bounds_changed = this.bounds != bounds;
                                                 this.bounds = bounds;
@@ -7224,11 +7222,7 @@ impl Render for Workspace {
                                                     });
                                                 }
                                             })
-                                        },
-                                        |_, _, _, _| {},
-                                    )
-                                    .absolute()
-                                    .size_full()
+                                        })
                                 })
                                 .when(self.zoomed.is_none(), |this| {
                                     this.on_drag_move(cx.listener(
@@ -8708,7 +8702,7 @@ pub fn client_side_decorations(
     element: impl IntoElement,
     window: &mut Window,
     cx: &mut App,
-) -> Stateful<Div> {
+) -> Div {
     const BORDER_SIZE: Pixels = px(1.0);
     let decorations = window.window_decorations();
 
@@ -8863,7 +8857,7 @@ pub fn client_side_decorations(
                                     CursorStyle::ResizeUpRightDownLeft
                                 }
                             },
-                            &hitbox,
+                            &*hitbox,
                         );
                     },
                 )

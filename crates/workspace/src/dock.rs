@@ -7,7 +7,7 @@ use client::proto;
 use gpui::{
     Action, AnyView, App, Axis, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
+    Render, SharedString, Styled, Subscription, WeakEntity, Window, div,
     px,
 };
 use settings::SettingsStore;
@@ -882,33 +882,30 @@ impl Render for Dock {
                     )
                     .occlude();
                 match self.position() {
-                    DockPosition::Left => deferred(
-                        handle
-                            .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
-                            .top(px(0.))
-                            .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
-                            .cursor_col_resize(),
-                    ),
-                    DockPosition::Bottom => deferred(
-                        handle
-                            .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
-                            .left(px(0.))
-                            .w_full()
-                            .h(RESIZE_HANDLE_SIZE)
-                            .cursor_row_resize(),
-                    ),
-                    DockPosition::Right => deferred(
-                        handle
-                            .absolute()
-                            .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
-                            .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
-                            .cursor_col_resize(),
-                    ),
+                    DockPosition::Left => handle
+                        .absolute()
+                        .right(-RESIZE_HANDLE_SIZE / 2.)
+                        .top(px(0.))
+                        .h_full()
+                        .w(RESIZE_HANDLE_SIZE)
+                        .cursor_col_resize()
+                        .z_index(0),
+                    DockPosition::Bottom => handle
+                        .absolute()
+                        .top(-RESIZE_HANDLE_SIZE / 2.)
+                        .left(px(0.))
+                        .w_full()
+                        .h(RESIZE_HANDLE_SIZE)
+                        .cursor_row_resize()
+                        .z_index(0),
+                    DockPosition::Right => handle
+                        .absolute()
+                        .top(px(0.))
+                        .left(-RESIZE_HANDLE_SIZE / 2.)
+                        .h_full()
+                        .w(RESIZE_HANDLE_SIZE)
+                        .cursor_col_resize()
+                        .z_index(0),
                 }
             };
 
@@ -934,12 +931,7 @@ impl Render for Dock {
                             Axis::Horizontal => this.min_w(size).h_full(),
                             Axis::Vertical => this.min_h(size).w_full(),
                         })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
+                        .child(entry.panel.to_any()),
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())

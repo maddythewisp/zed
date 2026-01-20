@@ -1,37 +1,37 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::taffy::TaffyLayoutEngine;
+use crate::fiber::StateStore;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
-    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+    ConstraintsBucket, Context, Corners, CursorStyle, Decorations, DevicePixels, DirtyFlags,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FiberEffects, FileDropEvent, FontId,
+    Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDispatcher, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, MeasurementCache,
+    MeasurementKey, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    SceneSegmentPool, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, Task, TextRenderingMode,
+    TextStyle, TextStyleRefinement, Transform2D, TransformId, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, div, point, prelude::*, px,
+    rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
-use collections::{FxHashMap, FxHashSet};
+use collections::{FxHashMap, FxHashSet, FxHasher};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
-use itertools::FoldWhile::{Continue, Done};
-use itertools::Itertools;
 use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
-use slotmap::SlotMap;
+use slotmap::{DefaultKey, SlotMap};
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
@@ -42,7 +42,7 @@ use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
-    ops::{DerefMut, Range},
+    ops::DerefMut,
     rc::Rc,
     sync::{
         Arc, Weak,
@@ -50,12 +50,17 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use util::post_inc;
+use taffy::tree::NodeId;
 use util::{ResultExt, measure};
 use uuid::Uuid;
 
+pub(crate) mod context;
 mod prompts;
 
+use crate::fiber::FiberRuntime;
+#[cfg(debug_assertions)]
+use crate::fiber::debug_assert_active_list_matches_map;
+pub(crate) use crate::fiber::{FiberRuntimeHandle, FiberRuntimeHandleRef, has_mouse_effects};
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
@@ -124,8 +129,19 @@ impl WindowInvalidator {
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.dirty_views.insert(entity);
-        if inner.draw_phase == DrawPhase::None {
-            inner.dirty = true;
+        inner.dirty = true;
+        if matches!(inner.draw_phase, DrawPhase::None | DrawPhase::Event) {
+            cx.push_effect(Effect::Notify { emitter: entity });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_dirty(&self, entity: EntityId, cx: &mut App) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        inner.dirty = true;
+        if matches!(inner.draw_phase, DrawPhase::None | DrawPhase::Event) {
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
@@ -145,6 +161,10 @@ impl WindowInvalidator {
         self.inner.borrow_mut().draw_phase = phase
     }
 
+    pub fn phase(&self) -> DrawPhase {
+        self.inner.borrow().draw_phase
+    }
+
     pub fn take_views(&self) -> FxHashSet<EntityId> {
         mem::take(&mut self.inner.borrow_mut().dirty_views)
     }
@@ -154,7 +174,10 @@ impl WindowInvalidator {
     }
 
     pub fn not_drawing(&self) -> bool {
-        self.inner.borrow().draw_phase == DrawPhase::None
+        matches!(
+            self.inner.borrow().draw_phase,
+            DrawPhase::None | DrawPhase::Event
+        )
     }
 
     #[track_caller]
@@ -166,26 +189,56 @@ impl WindowInvalidator {
     }
 
     #[track_caller]
-    pub fn debug_assert_prepaint(&self) {
+    pub fn debug_assert_layout_or_prepaint(&self) {
         debug_assert!(
-            matches!(self.inner.borrow().draw_phase, DrawPhase::Prepaint),
-            "this method can only be called during request_layout, or prepaint"
+            matches!(
+                self.inner.borrow().draw_phase,
+                DrawPhase::Layout | DrawPhase::Prepaint
+            ),
+            "this method can only be called during layout or prepaint"
         );
     }
 
     #[track_caller]
-    pub fn debug_assert_paint_or_prepaint(&self) {
+    pub fn debug_assert_prepaint_or_paint(&self) {
         debug_assert!(
             matches!(
                 self.inner.borrow().draw_phase,
                 DrawPhase::Paint | DrawPhase::Prepaint
             ),
-            "this method can only be called during request_layout, prepaint, or paint"
+            "this method can only be called during prepaint or paint"
+        );
+    }
+
+    #[track_caller]
+    pub fn debug_assert_layout_or_prepaint_or_paint(&self) {
+        debug_assert!(
+            matches!(
+                self.inner.borrow().draw_phase,
+                DrawPhase::Layout | DrawPhase::Prepaint | DrawPhase::Paint
+            ),
+            "this method can only be called during layout, prepaint, or paint"
+        );
+    }
+
+    #[track_caller]
+    pub fn debug_assert_reconcile_or_layout_or_prepaint_or_paint(&self) {
+        debug_assert!(
+            matches!(
+                self.inner.borrow().draw_phase,
+                DrawPhase::Reconcile | DrawPhase::Layout | DrawPhase::Prepaint | DrawPhase::Paint
+            ),
+            "this method can only be called during reconcile, layout, prepaint, or paint"
         );
     }
 }
 
 type AnyObserver = Box<dyn FnMut(&mut Window, &mut App) -> bool + 'static>;
+
+#[derive(Default)]
+pub(crate) struct GlobalIdScopeState {
+    pub(crate) children: FxHashMap<ElementId, GlobalElementId>,
+}
 
 pub(crate) type AnyWindowFocusListener =
     Box<dyn FnMut(&WindowFocusEvent, &mut Window, &mut App) -> bool + 'static>;
@@ -205,6 +258,59 @@ impl WindowFocusEvent {
     }
 }
 
+fn snapshot_hitboxes_into_map(
+    fiber_tree: &crate::fiber::FiberTree,
+    map: &mut FxHashMap<HitboxId, HitboxSnapshot>,
+) {
+    map.clear();
+    let Some(root) = fiber_tree.root else {
+        return;
+    };
+    let mut stack: Vec<GlobalElementId> = vec![root];
+    while let Some(fiber_id) = stack.pop() {
+        let children: SmallVec<[GlobalElementId; 8]> = fiber_tree.children(&fiber_id).collect();
+        for child in children {
+            stack.push(child);
+        }
+        let Some(data) = fiber_tree
+            .hitbox_state
+            .get(fiber_id.into())
+            .and_then(|state| state.hitbox.as_ref())
+        else {
+            continue;
+        };
+
+        map.insert(
+            fiber_id.into(),
+            HitboxSnapshot {
+                transform_id: data.transform_id,
+                bounds: data.bounds,
+                content_mask: data.content_mask.clone(),
+                behavior: data.behavior,
+            },
+        );
+    }
+}
+
+fn resolve_hitbox_for_hit_test(
+    window: &Window,
+    fiber_id: &GlobalElementId,
+) -> Option<HitboxSnapshot> {
+    let data = window
+        .fiber
+        .tree
+        .hitbox_state
+        .get((*fiber_id).into())
+        .and_then(|state| state.hitbox.as_ref())?;
+
+    Some(HitboxSnapshot {
+        transform_id: data.transform_id,
+        bounds: data.bounds,
+        content_mask: data.content_mask.clone(),
+        behavior: data.behavior,
+    })
+}
+
 /// This is provided when subscribing for `Context::on_focus_out` events.
 pub struct FocusOutEvent {
     /// A weak focus handle representing what was blurred.
@@ -214,81 +320,6 @@ pub struct FocusOutEvent {
 slotmap::new_key_type! {
     /// A globally unique identifier for a focusable element.
     pub struct FocusId;
-}
-
-thread_local! {
-    /// Fallback arena used when no app-specific arena is active.
-    /// In production, each window draw sets CURRENT_ELEMENT_ARENA to the app's arena.
-    pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
-
-    /// Points to the current App's element arena during draw operations.
-    /// This allows multiple test Apps to have isolated arenas, preventing
-    /// cross-session corruption when the scheduler interleaves their tasks.
-    static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
-}
-
-/// Allocates an element in the current arena. Uses the app-specific arena if one
-/// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
-pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    CURRENT_ELEMENT_ARENA.with(|current| {
-        if let Some(arena_ptr) = current.get() {
-            // SAFETY: The pointer is valid for the duration of the draw operation
-            // that set it, and we're being called during that same draw.
-            let arena_cell = unsafe { &*arena_ptr };
-            f(&mut arena_cell.borrow_mut())
-        } else {
-            ELEMENT_ARENA.with_borrow_mut(f)
-        }
-    })
-}
-
-/// RAII guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw operation.
-/// When dropped, restores the previous arena (supporting nested draws).
-pub(crate) struct ElementArenaScope {
-    previous: Option<*const RefCell<Arena>>,
-}
-
-impl ElementArenaScope {
-    /// Enter a scope where element allocations use the given arena.
-    pub(crate) fn enter(arena: &RefCell<Arena>) -> Self {
-        let previous = CURRENT_ELEMENT_ARENA.with(|current| {
-            let prev = current.get();
-            current.set(Some(arena as *const RefCell<Arena>));
-            prev
-        });
-        Self { previous }
-    }
-}
-
-impl Drop for ElementArenaScope {
-    fn drop(&mut self) {
-        CURRENT_ELEMENT_ARENA.with(|current| {
-            current.set(self.previous);
-        });
-    }
-}
-
-/// Returned when the element arena has been used and so must be cleared before the next draw.
-#[must_use]
-pub struct ArenaClearNeeded {
-    arena: *const RefCell<Arena>,
-}
-
-impl ArenaClearNeeded {
-    /// Create a new ArenaClearNeeded that will clear the given arena.
-    pub(crate) fn new(arena: &RefCell<Arena>) -> Self {
-        Self {
-            arena: arena as *const RefCell<Arena>,
-        }
-    }
-
-    /// Clear the element arena.
-    pub fn clear(self) {
-        // SAFETY: The arena pointer is valid because ArenaClearNeeded is created
-        // at the end of draw() and must be cleared before the next draw.
-        let arena_cell = unsafe { &*self.arena };
-        arena_cell.borrow_mut().clear();
-    }
 }
 
 pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
@@ -321,10 +352,7 @@ impl FocusId {
 
     /// Obtains whether this handle contains the given handle in the most recently rendered frame.
     pub(crate) fn contains(&self, other: Self, window: &Window) -> bool {
-        window
-            .rendered_frame
-            .dispatch_tree
-            .focus_contains(*self, other)
+        window.focus_contains(*self, other)
     }
 }
 
@@ -431,12 +459,8 @@ impl FocusHandle {
 
     /// Dispatch an action on the element that rendered this focus handle
     pub fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut App) {
-        if let Some(node_id) = window
-            .rendered_frame
-            .dispatch_tree
-            .focusable_node_id(self.id)
-        {
-            window.dispatch_action_on_node(node_id, action, cx)
+        if let Some(fiber_id) = window.fiber.tree.focusable_fibers.get(&self.id).copied() {
+            window.dispatch_action_on_node(fiber_id, action, cx)
         }
     }
 }
@@ -525,9 +549,6 @@ pub struct DismissEvent;
 
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
-pub(crate) type AnyMouseListener =
-    Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
-
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
@@ -538,6 +559,106 @@ pub(crate) struct CursorStyleRequest {
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
     pub(crate) hover_hitbox_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HitboxSnapshot {
+    pub(crate) transform_id: TransformId,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) content_mask: ContentMask<Pixels>,
+    pub(crate) behavior: HitboxBehavior,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransformStackFrame {
+    id: TransformId,
+    offset: Point<Pixels>,
+}
+
+/// Manages the current transform context during prepaint and paint.
+pub(crate) struct TransformStack {
+    frames: Vec<TransformStackFrame>,
+}
+
+impl Default for TransformStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransformStack {
+    pub(crate) fn new() -> Self {
+        Self {
+            frames: vec![TransformStackFrame {
+                id: TransformId::ROOT,
+                offset: Point::default(),
+            }],
+        }
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn truncate(&mut self, depth: usize) {
+        self.frames.truncate(depth.max(1));
+    }
+
+    pub(crate) fn set_local_offset(&mut self, offset: Point<Pixels>) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.offset = offset;
+        }
+    }
+
+    /// Get the current transform ID.
+    pub(crate) fn current(&self) -> TransformId {
+        self.frames
+            .last()
+            .map(|frame| frame.id)
+            .unwrap_or(TransformId::ROOT)
+    }
+
+    /// Get the current offset within this transform context.
+    pub(crate) fn local_offset(&self) -> Point<Pixels> {
+        self.frames
+            .last()
+            .map(|frame| frame.offset)
+            .unwrap_or_default()
+    }
+
+    /// Push a simple offset (accumulates into the current frame's offset).
+    pub(crate) fn push_offset(&mut self, offset: Point<Pixels>) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.offset.x += offset.x;
+            frame.offset.y += offset.y;
+        }
+    }
+
+    /// Pop a simple offset.
+    pub(crate) fn pop_offset(&mut self, offset: Point<Pixels>) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.offset.x -= offset.x;
+            frame.offset.y -= offset.y;
+        }
+    }
+
+    /// Push an existing transform context.
+    ///
+    /// This resets the local offset for the child context to 0, so that primitives can be stored
+    /// in the transform's local coordinate space.
+    pub(crate) fn push_existing_transform(&mut self, id: TransformId) {
+        self.frames.push(TransformStackFrame {
+            id,
+            offset: Point::default(),
+        });
+    }
+
+    /// Pop the current transform context.
+    pub(crate) fn pop_transform(&mut self) {
+        if self.frames.len() > 1 {
+            self.frames.pop();
+        }
+    }
 }
 
 /// A type of window control area that corresponds to the platform window.
@@ -555,34 +676,43 @@ pub enum WindowControlArea {
 
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct HitboxId(u64);
+pub struct HitboxId(NodeId);
 
 impl HitboxId {
-    /// Checks if the hitbox with this ID is currently hovered. Except when handling
-    /// `ScrollWheelEvent`, this is typically what you want when determining whether to handle mouse
-    /// events or paint hover styles.
-    ///
-    /// See [`Hitbox::is_hovered`] for details.
+    /// Checks if the hitbox with this ID is currently hovered.
     pub fn is_hovered(self, window: &Window) -> bool {
-        let hit_test = &window.mouse_hit_test;
-        for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
-            if self == *id {
-                return true;
-            }
-        }
-        false
+        window.hitbox_is_hovered(self)
     }
 
-    /// Checks if the hitbox with this ID contains the mouse and should handle scroll events.
-    /// Typically this should only be used when handling `ScrollWheelEvent`, and otherwise
-    /// `is_hovered` should be used. See the documentation of `Hitbox::is_hovered` for details about
-    /// this distinction.
+    /// Checks if the hitbox contains the mouse and should handle scroll events.
     pub fn should_handle_scroll(self, window: &Window) -> bool {
-        window.mouse_hit_test.ids.contains(&self)
+        window.hitbox_should_handle_scroll(self)
     }
+}
 
-    fn next(mut self) -> HitboxId {
-        HitboxId(self.0.wrapping_add(1))
+impl std::ops::Deref for HitboxId {
+    type Target = NodeId;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<NodeId> for HitboxId {
+    fn from(id: NodeId) -> Self {
+        Self(id)
+    }
+}
+
+impl From<HitboxId> for NodeId {
+    fn from(id: HitboxId) -> Self {
+        id.0
+    }
+}
+
+impl From<HitboxId> for DefaultKey {
+    fn from(id: HitboxId) -> Self {
+        id.0.into()
     }
 }
 
@@ -695,6 +825,12 @@ pub enum HitboxBehavior {
 pub struct TooltipId(usize);
 
 impl TooltipId {
+    pub(crate) fn next(&mut self) -> TooltipId {
+        let id = self.0;
+        self.0 = self.0.wrapping_add(1);
+        TooltipId(id)
+    }
+
     /// Checks if the tooltip is currently hovered.
     pub fn is_hovered(&self, window: &Window) -> bool {
         window
@@ -712,84 +848,70 @@ pub(crate) struct TooltipBounds {
     bounds: Bounds<Pixels>,
 }
 
+/// Tracks an active fiber-backed overlay (tooltip, prompt, or drag) for painting.
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveOverlay {
+    /// The fiber root for this overlay.
+    pub(crate) fiber_id: GlobalElementId,
+    /// The absolute offset to paint at.
+    pub(crate) offset: Point<Pixels>,
+    /// The view context for painting.
+    pub(crate) view_id: EntityId,
+}
+
 #[derive(Clone)]
 pub(crate) struct TooltipRequest {
-    id: TooltipId,
-    tooltip: AnyTooltip,
+    pub(crate) id: TooltipId,
+    pub(crate) tooltip: AnyTooltip,
 }
 
 pub(crate) struct DeferredDraw {
-    current_view: EntityId,
-    priority: usize,
-    parent_node: DispatchNodeId,
-    element_id_stack: SmallVec<[ElementId; 32]>,
-    text_style_stack: Vec<TextStyleRefinement>,
-    element: Option<AnyElement>,
-    absolute_offset: Point<Pixels>,
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
+    pub(crate) current_view: EntityId,
+    pub(crate) priority: usize,
+    pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) rem_size: Pixels,
+    pub(crate) element: Option<AnyElement>,
+    pub(crate) fiber_id: Option<GlobalElementId>,
+    pub(crate) reference_fiber: Option<GlobalElementId>,
+    pub(crate) local_offset: Point<Pixels>,
+    /// Whether this deferred draw needs its own layout pass.
+    ///
+    /// `false` for deferred drawing of an already-laid-out fiber subtree (e.g. `deferred(...)`).
+    /// `true` for detached overlay trees created via `Window::defer_draw`.
+    pub(crate) requires_layout: bool,
+    pub(crate) layout_constraints: Size<AvailableSpace>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HitboxesSnapshotEpoch {
+    structure_epoch: u64,
+    hitbox_epoch: u64,
 }
 
 pub(crate) struct Frame {
-    pub(crate) focus: Option<FocusId>,
+    pub(crate) focus_path: SmallVec<[FocusId; 8]>,
     pub(crate) window_active: bool,
-    pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
-    pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
-    pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
-    pub(crate) hitboxes: Vec<Hitbox>,
+    pub(crate) hitboxes: FxHashMap<HitboxId, HitboxSnapshot>,
+    hitboxes_epoch: Option<HitboxesSnapshotEpoch>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
-    pub(crate) deferred_draws: Vec<DeferredDraw>,
-    pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
-    pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
-    pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
-    pub(crate) tab_stops: TabStopMap,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct PrepaintStateIndex {
-    hitboxes_index: usize,
-    tooltips_index: usize,
-    deferred_draws_index: usize,
-    dispatch_tree_index: usize,
-    accessed_element_states_index: usize,
-    line_layout_index: LineLayoutIndex,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct PaintIndex {
-    scene_index: usize,
-    mouse_listeners_index: usize,
-    input_handlers_index: usize,
-    cursor_styles_index: usize,
-    accessed_element_states_index: usize,
-    tab_handle_index: usize,
-    line_layout_index: LineLayoutIndex,
 }
 
 impl Frame {
-    pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
+    pub(crate) fn new() -> Self {
         Frame {
-            focus: None,
+            focus_path: SmallVec::new(),
             window_active: false,
-            element_states: FxHashMap::default(),
-            accessed_element_states: Vec::new(),
-            mouse_listeners: Vec::new(),
-            dispatch_tree,
             scene: Scene::default(),
-            hitboxes: Vec::new(),
+            hitboxes: FxHashMap::default(),
+            hitboxes_epoch: None,
             window_control_hitboxes: Vec::new(),
-            deferred_draws: Vec::new(),
-            input_handlers: Vec::new(),
-            tooltip_requests: Vec::new(),
-            cursor_styles: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -799,24 +921,13 @@ impl Frame {
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
-            tab_stops: TabStopMap::default(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.element_states.clear();
-        self.accessed_element_states.clear();
-        self.mouse_listeners.clear();
-        self.dispatch_tree.clear();
-        self.scene.clear();
-        self.input_handlers.clear();
-        self.tooltip_requests.clear();
-        self.cursor_styles.clear();
-        self.hitboxes.clear();
+        self.scene.clear_transient();
         self.window_control_hitboxes.clear();
-        self.deferred_draws.clear();
-        self.tab_stops.clear();
-        self.focus = None;
+        self.focus_path.clear();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         {
@@ -825,59 +936,167 @@ impl Frame {
         }
     }
 
-    pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
-        self.cursor_styles
-            .iter()
-            .rev()
-            .fold_while(None, |style, request| match request.hitbox_id {
-                None => Done(Some(request.style)),
-                Some(hitbox_id) => Continue(
-                    style.or_else(|| hitbox_id.is_hovered(window).then_some(request.style)),
-                ),
-            })
-            .into_inner()
-    }
-
-    pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+    pub(crate) fn hit_test(&self, window: &Window, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
-                hit_test.ids.push(hitbox.id);
-                if !set_hover_hitbox_count
+
+        let viewport = window.viewport_size();
+        if position.x < px(0.)
+            || position.y < px(0.)
+            || position.x >= viewport.width
+            || position.y >= viewport.height
+        {
+            return hit_test;
+        }
+
+        let scale_factor = window.scale_factor();
+        let transforms = &window.segment_pool.transforms;
+        let world_scaled = Point::new(
+            ScaledPixels(position.x.0 * scale_factor),
+            ScaledPixels(position.y.0 * scale_factor),
+        );
+
+        // Returns true if we should stop (BlockMouse behavior hit)
+        let mut push_hitbox = |hit_test: &mut HitTest,
+                               set_hover_hitbox_count: &mut bool,
+                               hitbox_id: HitboxId,
+                               hitbox: &HitboxSnapshot| {
+            if !hitbox.content_mask.bounds.contains(&position) {
+                return false;
+            }
+
+            let local_scaled =
+                transforms.world_to_local_no_cache(hitbox.transform_id, world_scaled);
+            let local_point = Point::new(
+                Pixels(local_scaled.x.0 / scale_factor),
+                Pixels(local_scaled.y.0 / scale_factor),
+            );
+
+            if hitbox.bounds.contains(&local_point) {
+                hit_test.ids.push(hitbox_id);
+                if !*set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
                 {
                     hit_test.hover_hitbox_count = hit_test.ids.len();
-                    set_hover_hitbox_count = true;
+                    *set_hover_hitbox_count = true;
                 }
                 if hitbox.behavior == HitboxBehavior::BlockMouse {
+                    return true;
+                }
+            }
+            false
+        };
+
+        let should_visit_subtree = |fiber_id: GlobalElementId| {
+            window
+                .fiber
+                .tree
+                .hitbox_state
+                .get(fiber_id.into())
+                .and_then(|state| state.hitbox_subtree_bounds)
+                .is_some_and(|subtree| {
+                    let local_scaled =
+                        transforms.world_to_local_no_cache(subtree.transform_id, world_scaled);
+                    let local_point = Point::new(
+                        Pixels(local_scaled.x.0 / scale_factor),
+                        Pixels(local_scaled.y.0 / scale_factor),
+                    );
+                    subtree.bounds.contains(&local_point)
+                })
+        };
+
+        // Defered fibers (via `deferred(...)`) paint after all non-deferred content, regardless of
+        // their position in the tree. Hit-testing must mirror this paint order so overlays remain
+        // interactive even when declared before the content they cover.
+        let mut deferred_roots: Vec<(GlobalElementId, usize)> = window
+            .fiber
+            .active_deferred_draws
+            .members
+            .iter()
+            .filter_map(|fiber_id| {
+                window
+                    .fiber
+                    .tree
+                    .deferred_priorities
+                    .get((*fiber_id).into())
+                    .map(|&priority| (*fiber_id, priority))
+            })
+            .collect();
+        deferred_roots.sort_by_key(|(_, priority)| *priority);
+
+        let mut process_hitbox =
+            |fiber_id: GlobalElementId,
+             hit_test: &mut HitTest,
+             set_hover_hitbox_count: &mut bool| {
+                if let Some(hitbox) = self.hitboxes.get(&fiber_id.into()) {
+                    push_hitbox(hit_test, set_hover_hitbox_count, fiber_id.into(), hitbox)
+                } else if let Some(hitbox) = resolve_hitbox_for_hit_test(window, &fiber_id) {
+                    push_hitbox(hit_test, set_hover_hitbox_count, fiber_id.into(), &hitbox)
+                } else {
+                    false
+                }
+            };
+
+        // Process deferred roots first (topmost-first): higher priority is painted later (on top).
+        'outer: for (deferred_root, _priority) in deferred_roots.iter().rev().copied() {
+            let mut stack: Vec<(GlobalElementId, bool)> = vec![(deferred_root, true)];
+            while let Some((fiber_id, entering)) = stack.pop() {
+                if entering {
+                    if !should_visit_subtree(fiber_id) {
+                        continue;
+                    }
+                    stack.push((fiber_id, false));
+                    for child_id in window.fiber.tree.children_slice(&fiber_id) {
+                        stack.push((*child_id, true));
+                    }
+                } else if process_hitbox(fiber_id, &mut hit_test, &mut set_hover_hitbox_count) {
+                    break 'outer;
+                }
+            }
+        }
+
+        // Then process the main tree, skipping deferred subtrees (they were handled above).
+        if let Some(root) = window.fiber.tree.root {
+            let mut stack: Vec<(GlobalElementId, bool)> = vec![(root, true)];
+            while let Some((fiber_id, entering)) = stack.pop() {
+                if entering {
+                    if !should_visit_subtree(fiber_id) {
+                        continue;
+                    }
+                    if window
+                        .fiber
+                        .tree
+                        .deferred_priorities
+                        .contains_key(fiber_id.into())
+                    {
+                        continue;
+                    }
+                    stack.push((fiber_id, false));
+                    for child_id in window.fiber.tree.children_slice(&fiber_id) {
+                        stack.push((*child_id, true));
+                    }
+                } else if process_hitbox(fiber_id, &mut hit_test, &mut set_hover_hitbox_count) {
                     break;
                 }
             }
         }
+
         if !set_hover_hitbox_count {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
+
         hit_test
     }
 
-    pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
-        self.focus
-            .map(|focus_id| self.dispatch_tree.focus_path(focus_id))
-            .unwrap_or_default()
+    pub(crate) fn focus_path(&self) -> &SmallVec<[FocusId; 8]> {
+        &self.focus_path
     }
 
-    pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
-        for element_state_key in &self.accessed_element_states {
-            if let Some((element_state_key, element_state)) =
-                prev_frame.element_states.remove_entry(element_state_key)
-            {
-                self.element_states.insert(element_state_key, element_state);
-            }
-        }
-
-        self.scene.finish();
+    pub(crate) fn finish(
+        &mut self,
+        segment_pool: &mut SceneSegmentPool,
+    ) -> crate::scene::SceneFinishStats {
+        self.scene.finish(segment_pool)
     }
 }
 
@@ -885,6 +1104,76 @@ impl Frame {
 enum InputModality {
     Mouse,
     Keyboard,
+}
+
+/// Diagnostic counters for the most recently completed frame.
+///
+/// Enable in release builds via the `diagnostics` feature.
+#[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameDiagnostics {
+    /// Frame number for which these counters were recorded.
+    pub frame_number: u64,
+    /// `FiberTree` structure epoch at frame start.
+    pub structure_epoch: u64,
+    /// `FiberTree` hitbox epoch at frame end.
+    pub hitbox_epoch: u64,
+    /// Number of fibers that executed a prepaint this frame (not replayed).
+    pub prepaint_fibers: usize,
+    /// Number of subtrees whose prepaint state was replayed.
+    pub prepaint_replayed_subtrees: usize,
+    /// Number of fibers that executed paint this frame (not replayed).
+    pub paint_fibers: usize,
+    /// Number of subtrees whose paint output was replayed.
+    pub paint_replayed_subtrees: usize,
+    /// Whether the scene segment order was rebuilt.
+    pub segment_order_rebuilt: bool,
+    /// Scene segment order length when rebuilt.
+    pub scene_segment_order_len: usize,
+    /// Whether the hitbox snapshot map was rebuilt.
+    pub hitboxes_snapshot_rebuilt: bool,
+    /// Hitbox count in the snapshot map.
+    pub hitboxes_in_snapshot: usize,
+    /// Total allocated segments in the segment pool.
+    pub total_pool_segments: usize,
+    /// Segments mutated in the current scene mutation epoch.
+    pub mutated_pool_segments: usize,
+    /// Whether the transient segment was mutated.
+    pub transient_segment_mutated: bool,
+    /// Total path primitives in the scene.
+    pub paths: usize,
+    /// Total shadow primitives in the scene.
+    pub shadows: usize,
+    /// Total quad primitives in the scene.
+    pub quads: usize,
+    /// Total underline primitives in the scene.
+    pub underlines: usize,
+    /// Total monochrome sprite primitives in the scene.
+    pub monochrome_sprites: usize,
+    /// Total subpixel sprite primitives in the scene.
+    pub subpixel_sprites: usize,
+    /// Total polychrome sprite primitives in the scene.
+    pub polychrome_sprites: usize,
+    /// Total surface primitives in the scene.
+    pub surfaces: usize,
+    /// Estimated bytes uploaded for instance buffers if the entire scene is re-uploaded.
+    pub estimated_instance_upload_bytes: usize,
+    /// Number of fibers that had layout computed (cache miss).
+    pub layout_fibers: usize,
+    /// Time spent in the reconcile phase.
+    pub reconcile_time: std::time::Duration,
+    /// Time spent in the intrinsic sizing phase.
+    pub intrinsic_sizing_time: std::time::Duration,
+    /// Time spent in the layout phase.
+    pub layout_time: std::time::Duration,
+    /// Time spent in the prepaint phase.
+    pub prepaint_time: std::time::Duration,
+    /// Time spent in the paint phase.
+    pub paint_time: std::time::Duration,
+    /// Time spent in end-of-frame cleanup (clearing work flags, descendant tracking, etc.).
+    pub cleanup_time: std::time::Duration,
+    /// Total frame time.
+    pub total_time: std::time::Duration,
 }
 
 /// Holds the state for a specific window.
@@ -896,36 +1185,50 @@ pub struct Window {
     display_id: Option<DisplayId>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
+    pub(crate) layout_engine: TaffyLayoutEngine,
+    key_dispatch: KeyDispatcher,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
     /// The stack of override values for the window's rem size.
     ///
     /// This is used by `with_rem_size` to allow rendering an element tree with
     /// a given rem size.
-    rem_size_override_stack: SmallVec<[Pixels; 8]>,
+    pub(crate) rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
-    layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) fiber: FiberRuntime,
     pub(crate) root: Option<AnyView>,
-    pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
-    pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    pub(crate) transform_stack: TransformStack,
+    scroll_transforms: FxHashMap<GlobalElementId, TransformId>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    scene_culling_disabled_depth: usize,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
-    next_hitbox_id: HitboxId,
+    /// Shared storage for fiber scene segments. Persists across frame swaps so that
+    /// segment IDs allocated during paint remain valid when frames are swapped.
+    pub(crate) segment_pool: SceneSegmentPool,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    /// Active overlay state for fiber-backed overlays (tooltip/prompt/drag).
+    /// Stores the offset used during prepaint for use during paint.
+    pub(crate) active_overlay: Option<ActiveOverlay>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
-    pub(crate) dirty_views: FxHashSet<EntityId>,
+    render_layers: FxHashMap<ElementId, RenderLayerRegistration>,
+    next_render_layer_seq: usize,
+    global_overlay_owner_fiber: Option<GlobalElementId>,
+    measurement_generation: u64,
+    measurement_cache: MeasurementCache<MeasurementKey>,
+    pending_view_accesses: FxHashMap<GlobalElementId, FxHashSet<EntityId>>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
-    mouse_hit_test: HitTest,
+    pub(crate) mouse_hit_test: HitTest,
+    pending_mouse_hit_test_refresh: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -938,8 +1241,18 @@ pub struct Window {
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+    pub(crate) frame_diagnostics: FrameDiagnostics,
+    #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+    completed_frame_diagnostics: FrameDiagnostics,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    measurement_depth: u32,
+    /// Tracks whether a full reconciliation (structure change) occurred during the current frame.
+    /// Used to determine whether to update the entity invalidator mapping.
+    /// Only full reconciliation should update the mapping, as incremental rendering only
+    /// accesses a subset of entities and would incorrectly remove others.
+    full_reconciliation_this_frame: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_before_deactivation: Option<FocusId>,
@@ -951,6 +1264,15 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+}
+
+type RenderLayerBuilder = Arc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>;
+
+#[derive(Clone)]
+struct RenderLayerRegistration {
+    order: i32,
+    seq: usize,
+    build: RenderLayerBuilder,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1007,9 +1329,12 @@ impl InputRateTracker {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DrawPhase {
     None,
+    Reconcile,
+    Layout,
     Prepaint,
     Paint,
     Focus,
+    Event,
 }
 
 #[derive(Default, Debug)]
@@ -1018,12 +1343,6 @@ struct PendingInput {
     focus: Option<FocusId>,
     timer: Option<Task<()>>,
     needs_timeout: bool,
-}
-
-pub(crate) struct ElementStateBox {
-    pub(crate) inner: Box<dyn Any>,
-    #[cfg(debug_assertions)]
-    pub(crate) type_name: &'static str,
 }
 
 fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
@@ -1091,7 +1410,210 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
     window_bounds_ctor(Bounds::new(final_origin, base_size))
 }
 
+struct IntrinsicSizingOptions {
+    track_processed_islands: bool,
+    convergence_root: Option<GlobalElementId>,
+    force_compute: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// Tracks what was pushed by [`Window::push_fiber_scroll_transform`], so it can be popped later.
+pub struct FiberScrollTransformScope {
+    pushed_unculled_scene: bool,
+    pushed_transform: bool,
+}
+
+impl FiberScrollTransformScope {
+    /// A scope that indicates nothing was pushed.
+    pub const NONE: Self = Self {
+        pushed_unculled_scene: false,
+        pushed_transform: false,
+    };
+}
+
 impl Window {
+    pub(crate) fn effects_suppressed(&self) -> bool {
+        self.measurement_depth > 0
+    }
+
+    pub(crate) fn with_render_node_mut<R>(
+        &mut self,
+        fiber_id: GlobalElementId,
+        f: impl FnOnce(&mut dyn crate::RenderNode, &mut Window) -> R,
+    ) -> Option<R> {
+        let mut render_node = self.fiber.tree.render_nodes.remove(fiber_id.into())?;
+        let result = f(&mut *render_node, self);
+        self.fiber
+            .tree
+            .render_nodes
+            .insert(fiber_id.into(), render_node);
+        Some(result)
+    }
+
+    pub(crate) fn prepare_detached_root_for_layout(
+        &mut self,
+        root: GlobalElementId,
+        cx: &mut App,
+    ) {
+        self.compute_intrinsic_sizes_for_detached_root(root, cx);
+        crate::taffy::TaffyLayoutEngine::setup_taffy_from_fibers(self, root, cx);
+    }
+
+    fn update_platform_input_handler(&mut self, cx: &App) {
+        if !self.invalidator.not_drawing() {
+            return;
+        }
+        if let Some(input_handler) = self.fibers().latest_input_handler(cx) {
+            self.platform_window.set_input_handler(input_handler);
+        } else {
+            let _ = self.platform_window.take_input_handler();
+        }
+    }
+    pub(crate) fn fibers(&mut self) -> FiberRuntimeHandle<'_> {
+        FiberRuntimeHandle { window: self }
+    }
+
+    pub(crate) fn fibers_ref(&self) -> FiberRuntimeHandleRef<'_> {
+        FiberRuntimeHandleRef { window: self }
+    }
+
+    /// Returns true if the hitbox is currently hovered.
+    pub fn hitbox_is_hovered(&self, hitbox_id: HitboxId) -> bool {
+        self.mouse_hit_test
+            .ids
+            .iter()
+            .take(self.mouse_hit_test.hover_hitbox_count)
+            .any(|id| *id == hitbox_id)
+    }
+
+    /// Returns true if the hitbox should handle scroll events.
+    pub fn hitbox_should_handle_scroll(&self, hitbox_id: HitboxId) -> bool {
+        self.mouse_hit_test.ids.contains(&hitbox_id)
+    }
+
+    fn resolve_hitbox_bounds_world(&self, data: &crate::fiber::HitboxData) -> Bounds<Pixels> {
+        if data.transform_id.is_root() {
+            return data.bounds;
+        }
+
+        let scale_factor = self.scale_factor();
+        let local_scaled = data.bounds.scale(scale_factor);
+        let world = self
+            .segment_pool
+            .transforms
+            .get_world_no_cache(data.transform_id);
+        let origin_scaled = world.apply(local_scaled.origin);
+        let size_scaled = Size::new(
+            ScaledPixels(local_scaled.size.width.0 * world.scale),
+            ScaledPixels(local_scaled.size.height.0 * world.scale),
+        );
+
+        Bounds::new(
+            Point::new(
+                Pixels(origin_scaled.x.0 / scale_factor),
+                Pixels(origin_scaled.y.0 / scale_factor),
+            ),
+            Size::new(
+                Pixels(size_scaled.width.0 / scale_factor),
+                Pixels(size_scaled.height.0 / scale_factor),
+            ),
+        )
+    }
+
+    pub(crate) fn resolve_hitbox(&self, fiber_id: &GlobalElementId) -> Option<Hitbox> {
+        self.invalidator.debug_assert_prepaint_or_paint();
+        let data = self
+            .fiber
+            .tree
+            .hitbox_state
+            .get((*fiber_id).into())
+            .and_then(|state| state.hitbox.as_ref())?;
+
+        let bounds = self.resolve_hitbox_bounds_world(data);
+
+        Some(Hitbox {
+            id: (*fiber_id).into(),
+            bounds,
+            content_mask: data.content_mask.clone(),
+            behavior: data.behavior,
+        })
+    }
+
+    pub(crate) fn resolve_hitbox_for_event(&self, fiber_id: &GlobalElementId) -> Option<Hitbox> {
+        let data = self
+            .fiber
+            .tree
+            .hitbox_state
+            .get((*fiber_id).into())
+            .and_then(|state| state.hitbox.as_ref())?;
+
+        Some(Hitbox {
+            id: (*fiber_id).into(),
+            bounds: self.resolve_hitbox_bounds_world(data),
+            content_mask: data.content_mask.clone(),
+            behavior: data.behavior,
+        })
+    }
+
+    pub(crate) fn get_fiber_effects(&self, fiber_id: &GlobalElementId) -> Option<&FiberEffects> {
+        self.fiber.tree.effects.get((*fiber_id).into())
+    }
+
+    /// Inserts a hitbox associated with a fiber.
+    pub fn insert_hitbox_with_fiber(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        behavior: HitboxBehavior,
+        fiber_id: GlobalElementId,
+    ) -> Hitbox {
+        self.fibers()
+            .insert_hitbox_with_fiber(bounds, behavior, fiber_id)
+    }
+
+    pub(crate) fn register_fiber_effects(
+        &mut self,
+        fiber_id: &GlobalElementId,
+    ) -> Option<&mut FiberEffects> {
+        let entry = self.fiber.tree.effects.entry((*fiber_id).into())?;
+        let effects = entry.or_insert_with(FiberEffects::new);
+        Some(effects)
+    }
+
+    pub(crate) fn update_active_mouse_listeners(&mut self, fiber_id: &GlobalElementId) {
+        let effects = self.fiber.tree.effects.get((*fiber_id).into());
+        // Get interactivity from render node
+        let interactivity = self
+            .fiber
+            .tree
+            .render_nodes
+            .get((*fiber_id).into())
+            .and_then(|node| node.interactivity());
+        if has_mouse_effects(interactivity, effects) {
+            self.fiber.active_mouse_listeners.insert(*fiber_id);
+        } else {
+            self.fiber.active_mouse_listeners.remove(fiber_id);
+        }
+    }
+
+    pub(crate) fn clear_fiber_mouse_effects(&mut self, fiber_id: &GlobalElementId) {
+        if let Some(effects) = self.fiber.tree.effects.get_mut((*fiber_id).into()) {
+            effects.click_listeners.clear();
+            effects.any_mouse_listeners.clear();
+            effects.mouse_down_listeners.clear();
+            effects.mouse_up_listeners.clear();
+            effects.mouse_move_listeners.clear();
+            effects.mouse_pressure_listeners.clear();
+            effects.scroll_wheel_listeners.clear();
+            effects.drag_listener = None;
+            effects.drop_listeners.clear();
+            effects.can_drop_predicate = None;
+            effects.hover_listener = None;
+            effects.tooltip = None;
+            effects.cursor_style = None;
+        }
+        self.fiber.active_mouse_listeners.remove(fiber_id);
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         options: WindowOptions,
@@ -1206,9 +1728,8 @@ impl Window {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
-                                let arena_clear_needed = window.draw(cx);
+                                window.draw(cx);
                                 window.present();
-                                arena_clear_needed.clear();
                             })
                             .log_err();
                     })
@@ -1380,31 +1901,43 @@ impl Window {
             display_id,
             sprite_atlas,
             text_system,
+            layout_engine: TaffyLayoutEngine::new(),
+            key_dispatch: KeyDispatcher::new(cx.keymap.clone()),
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
-            layout_engine: Some(TaffyLayoutEngine::new()),
+            fiber: FiberRuntime::new(),
             root: None,
-            element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
-            element_offset_stack: Vec::new(),
+            transform_stack: TransformStack::new(),
+            scroll_transforms: FxHashMap::default(),
             content_mask_stack: Vec::new(),
+            scene_culling_disabled_depth: 0,
             element_opacity: 1.0,
             requested_autoscroll: None,
-            rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-            next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            rendered_frame: Frame::new(),
+            next_frame: Frame::new(),
+            segment_pool: SceneSegmentPool::default(),
             next_frame_callbacks,
-            next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
-            dirty_views: FxHashSet::default(),
+            active_overlay: None,
+            render_layers: FxHashMap::default(),
+            next_render_layer_seq: 0,
+            global_overlay_owner_fiber: None,
+            measurement_generation: 0,
+            measurement_cache: MeasurementCache::with_hysteresis(
+                crate::HysteresisPolicy::Pixels(px(0.5)),
+            ),
+            pending_view_accesses: FxHashMap::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pending_mouse_hit_test_refresh: false,
             modifiers,
             capslock,
             scale_factor,
@@ -1415,8 +1948,14 @@ impl Window {
             hovered,
             needs_present,
             input_rate_tracker,
+            #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+            frame_diagnostics: FrameDiagnostics::default(),
+            #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+            completed_frame_diagnostics: FrameDiagnostics::default(),
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            measurement_depth: 0,
+            full_reconciliation_this_frame: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_before_deactivation: None,
@@ -1472,18 +2011,8 @@ impl ContentMask<Pixels> {
 }
 
 impl Window {
-    fn mark_view_dirty(&mut self, view_id: EntityId) {
-        // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
-        // should already be dirty.
-        for view_id in self
-            .rendered_frame
-            .dispatch_tree
-            .view_path_reversed(view_id)
-        {
-            if !self.dirty_views.insert(view_id) {
-                break;
-            }
-        }
+    pub(crate) fn mark_view_dirty(&mut self, view_id: EntityId) {
+        self.fibers().mark_view_dirty(view_id);
     }
 
     /// Registers a callback to be invoked when the window appearance changes.
@@ -1513,6 +2042,7 @@ impl Window {
     {
         let view = cx.new(|cx| build_view(self, cx));
         self.root = Some(view.clone().into());
+        self.ensure_view_root_fiber(view.entity_id());
         self.refresh();
         view
     }
@@ -1540,6 +2070,258 @@ impl Window {
         }
     }
 
+    /// Schedule a redraw without forcing a full refresh/reconciliation path.
+    ///
+    /// This is useful for paint-only invalidation driven by runtime state (hover, scroll offset,
+    /// etc.) in the retained fiber architecture.
+    pub(crate) fn request_redraw(&mut self) {
+        if self.invalidator.not_drawing() {
+            self.invalidator.set_dirty(true);
+        }
+    }
+
+    /// Mark a specific fiber as needing paint and schedule a redraw.
+    pub(crate) fn invalidate_fiber_paint(&mut self, fiber_id: GlobalElementId) {
+        self.fiber
+            .tree
+            .mark_dirty(&fiber_id, DirtyFlags::NEEDS_PAINT);
+        self.request_redraw();
+    }
+
+    /// Mark a specific fiber as needing prepaint/paint and schedule a redraw.
+    ///
+    /// This is a lower-level escape hatch intended for retained/fiber-based components that need
+    /// to update visuals based on runtime state without re-running full view reconciliation.
+    pub fn invalidate_fiber_paint_public(&mut self, fiber_id: GlobalElementId) {
+        self.invalidate_fiber_paint(fiber_id);
+    }
+
+    /// Mark a specific fiber as having a transform-only change and schedule a redraw.
+    pub(crate) fn invalidate_fiber_transform(&mut self, fiber_id: GlobalElementId) {
+        self.fiber
+            .tree
+            .mark_dirty(&fiber_id, DirtyFlags::TRANSFORM_CHANGED);
+        self.request_redraw();
+    }
+
+    pub(crate) fn ensure_scroll_transform(
+        &mut self,
+        fiber_id: GlobalElementId,
+        parent: TransformId,
+        scroll_offset: Point<Pixels>,
+    ) -> TransformId {
+        let scale_factor = self.scale_factor();
+        let offset = Point::new(
+            ScaledPixels(scroll_offset.x.0 * scale_factor),
+            ScaledPixels(scroll_offset.y.0 * scale_factor),
+        );
+        let transform = Transform2D {
+            offset,
+            scale: 1.0,
+            parent,
+        };
+
+        if let Some(id) = self.scroll_transforms.get(&fiber_id).copied() {
+            self.segment_pool.transforms.insert(id, transform);
+            id
+        } else {
+            let id = self.segment_pool.transforms.push(transform);
+            self.scroll_transforms.insert(fiber_id, id);
+            id
+        }
+    }
+
+    /// Push an unculling scope and a persistent scroll transform for the given fiber.
+    ///
+    /// This is intended for custom scroll containers implemented outside of `gpui`.
+    pub fn push_fiber_scroll_transform(
+        &mut self,
+        fiber_id: GlobalElementId,
+        scroll_offset: Point<Pixels>,
+    ) -> FiberScrollTransformScope {
+        self.push_unculled_scene();
+
+        let parent = self.transform_stack.current();
+        let transform_id = self.ensure_scroll_transform(fiber_id, parent, scroll_offset);
+        self.transform_stack.push_existing_transform(transform_id);
+
+        FiberScrollTransformScope {
+            pushed_unculled_scene: true,
+            pushed_transform: true,
+        }
+    }
+
+    /// Pop a scope previously returned by [`Window::push_fiber_scroll_transform`].
+    pub fn pop_fiber_scroll_transform(&mut self, scope: FiberScrollTransformScope) {
+        if scope.pushed_transform {
+            self.transform_stack.pop_transform();
+        }
+        if scope.pushed_unculled_scene {
+            self.pop_unculled_scene();
+        }
+    }
+
+    /// Mark a scroll container as having a transform-only change and update its persistent scroll
+    /// transform in O(1).
+    ///
+    /// This is intended for custom scroll containers implemented outside of `gpui`.
+    pub fn invalidate_scroll_transform(
+        &mut self,
+        fiber_id: GlobalElementId,
+        scroll_offset: Point<Pixels>,
+        cx: &mut App,
+    ) {
+        self.invalidate_fiber_scroll(fiber_id, scroll_offset, cx);
+    }
+
+    /// Mark a scroll container as having a transform-only change and update its scroll transform in
+    /// O(1).
+    pub(crate) fn invalidate_fiber_scroll(
+        &mut self,
+        fiber_id: GlobalElementId,
+        scroll_offset: Point<Pixels>,
+        cx: &mut App,
+    ) {
+        self.invalidate_fiber_transform(fiber_id);
+
+        if let Some(transform_id) = self.scroll_transforms.get(&fiber_id).copied() {
+            let scale_factor = self.scale_factor();
+            let scaled = Point::new(
+                ScaledPixels(scroll_offset.x.0 * scale_factor),
+                ScaledPixels(scroll_offset.y.0 * scale_factor),
+            );
+            self.segment_pool
+                .transforms
+                .update_offset(transform_id, scaled);
+        }
+
+        self.pending_mouse_hit_test_refresh = true;
+        self.apply_pending_mouse_hit_test_refresh(cx);
+    }
+
+    pub(crate) fn apply_pending_mouse_hit_test_refresh(&mut self, cx: &mut App) {
+        if !self.pending_mouse_hit_test_refresh {
+            return;
+        }
+        self.pending_mouse_hit_test_refresh = false;
+
+        let previous_hit_test = HitTest {
+            ids: self.mouse_hit_test.ids.clone(),
+            hover_hitbox_count: self.mouse_hit_test.hover_hitbox_count,
+        };
+
+        let current_hit_test = self.rendered_frame.hit_test(self, self.mouse_position);
+        if current_hit_test == self.mouse_hit_test {
+            return;
+        }
+
+        self.mouse_hit_test = current_hit_test;
+        self.reset_cursor_style(cx);
+        self.update_hover_states_for_hit_test_change(&previous_hit_test, cx);
+    }
+
+    fn update_hover_states_for_hit_test_change(
+        &mut self,
+        previous_hit_test: &HitTest,
+        cx: &mut App,
+    ) {
+        let current_hit_test = &self.mouse_hit_test;
+
+        let mut target_hitboxes: SmallVec<[HitboxId; 16]> = SmallVec::new();
+        let mut seen: FxHashSet<HitboxId> = FxHashSet::default();
+
+        for id in current_hit_test
+            .ids
+            .iter()
+            .take(current_hit_test.hover_hitbox_count)
+            .copied()
+        {
+            if seen.insert(id) {
+                target_hitboxes.push(id);
+            }
+        }
+        for id in previous_hit_test
+            .ids
+            .iter()
+            .take(previous_hit_test.hover_hitbox_count)
+            .copied()
+        {
+            if seen.insert(id) {
+                target_hitboxes.push(id);
+            }
+        }
+
+        for hitbox_id in target_hitboxes {
+            let fiber_id: GlobalElementId = hitbox_id.into();
+            if self.fiber.tree.get(&fiber_id).is_none() {
+                continue;
+            }
+
+            let (has_hover_style, group_hover) = {
+                let Some(interactivity) = self
+                    .fiber
+                    .tree
+                    .render_nodes
+                    .get(fiber_id.into())
+                    .and_then(|node| node.interactivity())
+                else {
+                    continue;
+                };
+                (
+                    interactivity.hover_style.is_some(),
+                    interactivity
+                        .group_hover_style
+                        .as_ref()
+                        .map(|group_hover| group_hover.group.clone()),
+                )
+            };
+
+            if has_hover_style {
+                let _ = self.with_element_state_in_event::<crate::InteractiveElementState, _>(
+                    &fiber_id,
+                    |element_state, window| {
+                        let mut element_state = element_state.unwrap_or_default();
+                        let hover_state = element_state
+                            .hover_state
+                            .get_or_insert_with(Default::default)
+                            .clone();
+                        let hovered = window.hitbox_is_hovered(hitbox_id);
+                        let mut hover_state = hover_state.borrow_mut();
+                        if hovered != hover_state.element {
+                            hover_state.element = hovered;
+                            drop(hover_state);
+                            window.invalidate_fiber_paint(fiber_id);
+                        }
+                        ((), element_state)
+                    },
+                );
+            }
+
+            if let Some(group) = group_hover {
+                if let Some(group_hitbox_id) = crate::GroupHitboxes::get(&group, cx) {
+                    let _ = self.with_element_state_in_event::<crate::InteractiveElementState, _>(
+                        &fiber_id,
+                        |element_state, window| {
+                            let mut element_state = element_state.unwrap_or_default();
+                            let hover_state = element_state
+                                .hover_state
+                                .get_or_insert_with(Default::default)
+                                .clone();
+                            let group_hovered = window.hitbox_is_hovered(group_hitbox_id);
+                            let mut hover_state = hover_state.borrow_mut();
+                            if group_hovered != hover_state.group {
+                                hover_state.group = group_hovered;
+                                drop(hover_state);
+                                window.invalidate_fiber_paint(fiber_id);
+                            }
+                            ((), element_state)
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
@@ -1551,6 +2333,10 @@ impl Window {
             .and_then(|id| FocusHandle::for_id(id, &cx.focus_handles))
     }
 
+    fn focus_contains(&self, parent: FocusId, child: FocusId) -> bool {
+        self.fibers_ref().focus_contains(parent, child)
+    }
+
     /// Move focus to the element associated with the given [`FocusHandle`].
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
@@ -1559,6 +2345,7 @@ impl Window {
 
         self.focus = Some(handle.id);
         self.clear_pending_keystrokes();
+        self.update_platform_input_handler(cx);
 
         // Avoid re-entrant entity updates by deferring observer notifications to the end of the
         // current effect cycle, and only for this window.
@@ -1581,6 +2368,9 @@ impl Window {
         }
 
         self.focus = None;
+        if self.invalidator.not_drawing() {
+            let _ = self.platform_window.take_input_handler();
+        }
         self.refresh();
     }
 
@@ -1596,7 +2386,7 @@ impl Window {
             return;
         }
 
-        if let Some(handle) = self.rendered_frame.tab_stops.next(self.focus.as_ref()) {
+        if let Some(handle) = self.fibers_ref().next_tab_stop(self.focus.as_ref()) {
             self.focus(&handle, cx)
         }
     }
@@ -1607,7 +2397,7 @@ impl Window {
             return;
         }
 
-        if let Some(handle) = self.rendered_frame.tab_stops.prev(self.focus.as_ref()) {
+        if let Some(handle) = self.fibers_ref().prev_tab_stop(self.focus.as_ref()) {
             self.focus(&handle, cx)
         }
     }
@@ -1834,7 +2624,15 @@ impl Window {
     ///
     /// If called from within a view, it will notify that view on the next frame. Otherwise, it will refresh the entire window.
     pub fn request_animation_frame(&self) {
-        let entity = self.current_view();
+        // Get the current view without phase assertion - this can be called during reconciliation
+        // when views are being rendered (expand_view_fibers phase)
+        let entity = if let Some(id) = self.rendered_entity_stack.last().copied() {
+            id
+        } else {
+            self.root.as_ref().map(|root| root.entity_id()).expect(
+                "Window::request_animation_frame called with no rendered view and no root view",
+            )
+        };
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
 
@@ -1879,6 +2677,9 @@ impl Window {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
+        self.measurement_generation = self.measurement_generation.wrapping_add(1);
+        self.measurement_cache
+            .evict_stale_generations(self.measurement_generation);
 
         self.refresh();
 
@@ -1898,7 +2699,7 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
-            .render_to_image(&self.rendered_frame.scene)
+            .render_to_image(&self.rendered_frame.scene, &self.segment_pool)
     }
 
     /// Set the content size of the window.
@@ -2042,6 +2843,89 @@ impl Window {
     /// UI to scale, just like zooming a web page.
     pub fn set_rem_size(&mut self, rem_size: impl Into<Pixels>) {
         self.rem_size = rem_size.into();
+        self.measurement_generation = self.measurement_generation.wrapping_add(1);
+        self.measurement_cache
+            .evict_stale_generations(self.measurement_generation);
+    }
+
+    /// Returns the current measurement cache generation.
+    pub fn measurement_generation(&self) -> u64 {
+        self.measurement_generation
+    }
+
+    /// Look up a cached measured size for the given key and constraints.
+    pub fn measured_size_for(
+        &self,
+        key: MeasurementKey,
+        constraints: Size<AvailableSpace>,
+    ) -> Option<Size<Pixels>> {
+        let bucket = ConstraintsBucket::from_available_space_default(constraints);
+        self.measurement_cache
+            .get_stale_ok(key, bucket, self.measurement_generation)
+            .map(|(size, _generation)| size)
+    }
+
+    /// Check if there is a cached measured size for the given key and constraints.
+    pub fn has_measured_size_for(
+        &self,
+        key: MeasurementKey,
+        constraints: Size<AvailableSpace>,
+    ) -> bool {
+        self.measured_size_for(key, constraints).is_some()
+    }
+
+    /// Record a measured size for the given key and constraints. Returns true if the size changed.
+    pub fn record_measured_size_for(
+        &mut self,
+        key: MeasurementKey,
+        constraints: Size<AvailableSpace>,
+        size: Size<Pixels>,
+    ) -> bool {
+        let bucket = ConstraintsBucket::from_available_space_default(constraints);
+        let changed = self
+            .measurement_cache
+            .insert(key, bucket, self.measurement_generation, size);
+        if changed {
+            self.measurement_cache
+                .evict_stale_generations(self.measurement_generation);
+        }
+        changed
+    }
+
+    /// Wrap an element with measurement caching using an auto-generated key.
+    #[track_caller]
+    pub fn with_cached_measurement(
+        &mut self,
+        element: AnyElement,
+        constraints: Size<AvailableSpace>,
+        default_size: Size<Pixels>,
+    ) -> (AnyElement, Size<Pixels>) {
+        let key = MeasurementKey::for_callsite(0);
+        self.with_cached_measurement_keyed(key, element, constraints, default_size)
+    }
+
+    /// Wrap an element with measurement caching using a custom key.
+    pub fn with_cached_measurement_keyed(
+        &mut self,
+        key: MeasurementKey,
+        element: AnyElement,
+        constraints: Size<AvailableSpace>,
+        default_size: Size<Pixels>,
+    ) -> (AnyElement, Size<Pixels>) {
+        let size = self
+            .measured_size_for(key, constraints)
+            .unwrap_or(default_size);
+
+        let element = div()
+            .child(element)
+            .on_layout(move |bounds, window, _cx| {
+                if window.record_measured_size_for(key, constraints, bounds.size) {
+                    window.refresh();
+                }
+            })
+            .into_any();
+
+        (element, size)
     }
 
     /// Acquire a globally unique identifier for the given ElementId.
@@ -2051,17 +2935,56 @@ impl Window {
         element_id: ElementId,
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id);
-        let global_id = GlobalElementId(Arc::from(&*self.element_id_stack));
+        self.invalidator
+            .debug_assert_reconcile_or_layout_or_prepaint_or_paint();
 
-        let result = f(&global_id, self);
-        self.element_id_stack.pop();
-        result
+        let parent_id = self.ensure_fiber_for_current_id();
+        let mut reused = true;
+        let scoped_id =
+            self.with_element_state(&parent_id, |state: Option<GlobalIdScopeState>, window| {
+                let mut state = state.unwrap_or_default();
+
+                let scoped_id = match state.children.get(&element_id).copied() {
+                    Some(existing_id) if window.fiber.tree.get(&existing_id).is_some() => {
+                        existing_id
+                    }
+                    _ => {
+                        reused = false;
+                        let new_id = window.fiber.tree.create_state_only_child(parent_id);
+                        if let Some(fiber) = window.fiber.tree.get_mut(&new_id) {
+                            fiber.key = Some(element_id.clone());
+                            fiber.child_count = 0;
+                        }
+
+                        state.children.insert(element_id.clone(), new_id);
+                        new_id
+                    }
+                };
+
+                (scoped_id, state)
+            });
+
+        let stack = &self.fiber.fiber_id_stack;
+        let len = stack.len();
+        let preview_len = len.min(16);
+        let start = len.saturating_sub(preview_len);
+        let preview = &stack[start..];
+        log::trace!(
+            "[WITH_GLOBAL_ID] element_id={:?} parent_id={:?} scoped_id={:?} reused={} fiber_stack=len={} tail={:?}",
+            element_id,
+            parent_id,
+            scoped_id,
+            reused,
+            len,
+            preview
+        );
+
+        self.with_element_id_stack(&scoped_id, |window| f(&scoped_id, window))
     }
 
     /// Executes the provided function with the specified rem size.
     ///
-    /// This method must only be called as part of element drawing.
+    /// This method must only be called as part of element layout or drawing.
     // This function is called in a highly recursive manner in editor
     // prepainting, make sure its inlined to reduce the stack burden
     #[inline]
@@ -2069,7 +2992,7 @@ impl Window {
     where
         F: FnOnce(&mut Self) -> R,
     {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_layout_or_prepaint_or_paint();
 
         if let Some(rem_size) = rem_size {
             self.rem_size_override_stack.push(rem_size.into());
@@ -2097,26 +3020,76 @@ impl Window {
         self.default_prevented
     }
 
+    /// Register a window-global render layer.
+    ///
+    /// Render layers are invoked once per window per frame, after the root view
+    /// has been prepainted (so they can rely on layout-bound state) and before
+    /// hit-testing is finalized.
+    ///
+    /// Layers are painted after the root view and before deferred draws,
+    /// prompts, and tooltips. Ordering between layers is controlled by `order`
+    /// (lower first). Ties are broken by first-registration order.
+    pub fn register_render_layer<F>(&mut self, key: impl Into<ElementId>, order: i32, build: F)
+    where
+        F: Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    {
+        let key = key.into();
+        let build: RenderLayerBuilder = Arc::new(build);
+
+        if let Some(registration) = self.render_layers.get_mut(&key) {
+            registration.order = order;
+            registration.build = build;
+            return;
+        }
+
+        let seq = self.next_render_layer_seq;
+        self.next_render_layer_seq = self.next_render_layer_seq.saturating_add(1);
+        self.render_layers
+            .insert(key, RenderLayerRegistration { order, seq, build });
+    }
+
+    /// Unregister a render layer by key.
+    pub fn unregister_render_layer(&mut self, key: &ElementId) {
+        self.render_layers.remove(key);
+    }
+
+    /// Returns true if the given render layer key is registered.
+    pub fn has_render_layer(&self, key: &ElementId) -> bool {
+        self.render_layers.contains_key(key)
+    }
+
     /// Determine whether the given action is available along the dispatch path to the currently focused element.
     pub fn is_action_available(&self, action: &dyn Action, cx: &App) -> bool {
         let node_id =
             self.focus_node_id_in_rendered_frame(self.focused(cx).map(|handle| handle.id));
-        self.rendered_frame
-            .dispatch_tree
-            .is_action_available(action, node_id)
+        self.fibers_ref()
+            .is_action_available_for_node(action, node_id)
     }
 
     /// Determine whether the given action is available along the dispatch path to the given focus_handle.
     pub fn is_action_available_in(&self, action: &dyn Action, focus_handle: &FocusHandle) -> bool {
         let node_id = self.focus_node_id_in_rendered_frame(Some(focus_handle.id));
-        self.rendered_frame
-            .dispatch_tree
-            .is_action_available(action, node_id)
+        self.fibers_ref()
+            .is_action_available_for_node(action, node_id)
     }
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
         self.mouse_position
+    }
+
+    /// Hit-test the rendered frame at the given window position.
+    ///
+    /// Returns hitbox IDs from topmost to bottommost.
+    pub fn hit_test_ids(&self, position: Point<Pixels>) -> SmallVec<[HitboxId; 8]> {
+        self.rendered_frame.hit_test(self, position).ids
+    }
+
+    /// Returns diagnostic counters for the most recently completed frame.
+    #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+    #[allow(clippy::misnamed_getters)]
+    pub fn frame_diagnostics(&self) -> FrameDiagnostics {
+        self.completed_frame_diagnostics
     }
 
     /// The current state of the keyboard's modifiers
@@ -2142,79 +3115,235 @@ impl Window {
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
-    pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
-        // Set up the per-App arena for element allocation during this draw.
-        // This ensures that multiple test Apps have isolated arenas.
-        let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
-
-        self.invalidate_entities();
-        cx.entities.clear_accessed();
-        debug_assert!(self.rendered_entity_stack.is_empty());
-        self.invalidator.set_dirty(false);
-        self.requested_autoscroll = None;
-
-        // Restore the previously-used input handler.
-        if let Some(input_handler) = self.platform_window.take_input_handler() {
-            self.rendered_frame.input_handlers.push(Some(input_handler));
-        }
+    pub fn draw(&mut self, cx: &mut App) {
+        self.prepare_frame(cx);
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
         }
-        self.dirty_views.clear();
+        for segment_id in self.fiber.tree.take_removed_scene_segments() {
+            self.segment_pool.remove_segment(segment_id);
+        }
+        self.rebuild_scene_segment_order_if_needed();
+        self.cleanup_removed_fibers();
+        self.fibers().rebuild_collection_ordering();
+        #[cfg(debug_assertions)]
+        self.debug_assert_incremental_collections();
+        self.finalize_frame(cx);
+        self.fiber.log_frame_diagnostics();
+    }
+
+    fn prepare_frame(&mut self, cx: &mut App) {
+        self.invalidate_entities();
+        cx.entities.clear_accessed();
+        self.full_reconciliation_this_frame = false;
+        debug_assert!(self.rendered_entity_stack.is_empty());
+        self.invalidator.set_dirty(false);
+        self.requested_autoscroll = None;
+        self.fiber.layout_bounds_cache.clear();
+        self.fiber.fiber_id_stack.clear();
+        self.fiber.hitbox_stack.clear();
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame
+            .debug_bounds
+            .clone_from(&self.rendered_frame.debug_bounds);
+
+        self.next_frame.scene.begin_frame();
+
+        // Restore the previously-used input handler.
+        self.platform_window.take_input_handler();
+    }
+
+    fn finalize_frame(&mut self, cx: &mut App) {
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
-        if let Some(input_handler) = self.next_frame.input_handlers.pop() {
-            self.platform_window
-                .set_input_handler(input_handler.unwrap());
+        if let Some(input_handler) = self.fibers().latest_input_handler(cx) {
+            self.platform_window.set_input_handler(input_handler);
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
-        self.next_frame.finish(&mut self.rendered_frame);
+        let scene_finish_stats = {
+            let fiber_tree = &self.fiber.tree;
+            let hitboxes_epoch = HitboxesSnapshotEpoch {
+                structure_epoch: fiber_tree.structure_epoch,
+                hitbox_epoch: fiber_tree.hitbox_epoch(),
+            };
+            if self.next_frame.hitboxes_epoch != Some(hitboxes_epoch) {
+                snapshot_hitboxes_into_map(fiber_tree, &mut self.next_frame.hitboxes);
+                self.next_frame.hitboxes_epoch = Some(hitboxes_epoch);
+                #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+                {
+                    self.frame_diagnostics.hitboxes_snapshot_rebuilt = true;
+                }
+            }
+            #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+            {
+                self.frame_diagnostics.hitboxes_in_snapshot = self.next_frame.hitboxes.len();
+                self.frame_diagnostics.hitbox_epoch = hitboxes_epoch.hitbox_epoch;
+            }
+
+            self.next_frame.finish(&mut self.segment_pool)
+        };
+        #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+        {
+            self.frame_diagnostics.total_pool_segments = scene_finish_stats.total_pool_segments;
+            self.frame_diagnostics.mutated_pool_segments = scene_finish_stats.mutated_pool_segments;
+            self.frame_diagnostics.transient_segment_mutated = scene_finish_stats.transient_mutated;
+
+            let scene = &self.next_frame.scene;
+            let pool = &self.segment_pool;
+            self.frame_diagnostics.paths = scene.paths_len(pool);
+            self.frame_diagnostics.shadows = scene.shadows_len(pool);
+            self.frame_diagnostics.quads = scene.quads_len(pool);
+            self.frame_diagnostics.underlines = scene.underlines_len(pool);
+            self.frame_diagnostics.monochrome_sprites = scene.monochrome_sprites_len(pool);
+            self.frame_diagnostics.subpixel_sprites = scene.subpixel_sprites_len(pool);
+            self.frame_diagnostics.polychrome_sprites = scene.polychrome_sprites_len(pool);
+            self.frame_diagnostics.surfaces = scene.surfaces_len(pool);
+
+            use std::mem::size_of;
+            self.frame_diagnostics.estimated_instance_upload_bytes = self
+                .frame_diagnostics
+                .shadows
+                .saturating_mul(
+                    size_of::<crate::scene::Shadow>() + size_of::<TransformationMatrix>(),
+                )
+                .saturating_add(self.frame_diagnostics.quads.saturating_mul(
+                    size_of::<crate::scene::Quad>() + size_of::<TransformationMatrix>(),
+                ))
+                .saturating_add(self.frame_diagnostics.underlines.saturating_mul(
+                    size_of::<crate::scene::Underline>() + size_of::<TransformationMatrix>(),
+                ))
+                .saturating_add(
+                    self.frame_diagnostics
+                        .monochrome_sprites
+                        .saturating_mul(size_of::<crate::scene::MonochromeSprite>()),
+                )
+                .saturating_add(
+                    self.frame_diagnostics
+                        .subpixel_sprites
+                        .saturating_mul(size_of::<crate::scene::SubpixelSprite>()),
+                )
+                .saturating_add(self.frame_diagnostics.polychrome_sprites.saturating_mul(
+                    size_of::<crate::scene::PolychromeSprite>() + size_of::<TransformationMatrix>(),
+                ))
+                .saturating_add(
+                    self.frame_diagnostics
+                        .paths
+                        .saturating_mul(size_of::<crate::Path<ScaledPixels>>()),
+                )
+                .saturating_add(
+                    self.frame_diagnostics
+                        .surfaces
+                        .saturating_mul(size_of::<crate::scene::PaintSurface>()),
+                );
+        }
+        let _ = scene_finish_stats;
+        self.next_frame.focus_path = self.fibers_ref().focus_path_for(self.focus);
 
         self.invalidator.set_phase(DrawPhase::Focus);
-        let previous_focus_path = self.rendered_frame.focus_path();
+        let previous_focus_path = self.rendered_frame.focus_path().clone();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
-        let current_focus_path = self.rendered_frame.focus_path();
+        let current_focus_path = self.rendered_frame.focus_path().clone();
         let current_window_active = self.rendered_frame.window_active;
 
         if previous_focus_path != current_focus_path
             || previous_window_active != current_window_active
         {
-            if !previous_focus_path.is_empty() && current_focus_path.is_empty() {
-                self.focus_lost_listeners
-                    .clone()
-                    .retain(&(), |listener| listener(self, cx));
-            }
-
-            let event = WindowFocusEvent {
-                previous_focus_path: if previous_window_active {
-                    previous_focus_path
-                } else {
-                    Default::default()
-                },
-                current_focus_path: if current_window_active {
-                    current_focus_path
-                } else {
-                    Default::default()
-                },
-            };
-            self.focus_listeners
-                .clone()
-                .retain(&(), |listener| listener(&event, self, cx));
+            self.dispatch_focus_change_events(
+                previous_focus_path,
+                current_focus_path,
+                previous_window_active,
+                current_window_active,
+                cx,
+            );
         }
 
         debug_assert!(self.rendered_entity_stack.is_empty());
-        self.record_entities_accessed(cx);
+        // Only update the entity invalidator mapping during full reconciliation.
+        // During incremental rendering (Branch 2), only some views are rendered,
+        // so accessed_entities only contains a subset. Using that to update the
+        // mapping would incorrectly remove entities from views that weren't rendered.
+        if self.full_reconciliation_this_frame {
+            self.record_entities_accessed(cx);
+        }
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
-        ArenaClearNeeded::new(&cx.element_arena)
+        #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+        {
+            self.completed_frame_diagnostics = self.frame_diagnostics;
+        }
+    }
+
+    /// Dispatch any pending focus change events without performing a full draw cycle.
+    ///
+    /// This is useful when you need focus change listeners to be notified immediately,
+    /// such as between programmatic keystrokes where focus may change and subsequent
+    /// keystrokes depend on the new focus state (e.g., vim mode).
+    ///
+    /// In the fiber architecture, the focus path can be computed at any time from the
+    /// persistent fiber tree, enabling this lightweight focus event dispatch without
+    /// requiring a full layout/paint cycle.
+    pub fn dispatch_pending_focus_events(&mut self, cx: &mut App) {
+        let current_focus_path = self.fibers_ref().focus_path_for(self.focus);
+        let previous_focus_path = self.rendered_frame.focus_path.clone();
+
+        if previous_focus_path != current_focus_path {
+            self.dispatch_focus_change_events(
+                previous_focus_path,
+                current_focus_path.clone(),
+                self.rendered_frame.window_active,
+                self.rendered_frame.window_active,
+                cx,
+            );
+            self.rendered_frame.focus_path = current_focus_path;
+        }
+    }
+
+    fn dispatch_focus_change_events(
+        &mut self,
+        previous_focus_path: SmallVec<[FocusId; 8]>,
+        current_focus_path: SmallVec<[FocusId; 8]>,
+        previous_window_active: bool,
+        current_window_active: bool,
+        cx: &mut App,
+    ) {
+        if !previous_focus_path.is_empty() && current_focus_path.is_empty() {
+            self.focus_lost_listeners
+                .clone()
+                .retain(&(), |listener| listener(self, cx));
+        }
+
+        let event = WindowFocusEvent {
+            previous_focus_path: if previous_window_active {
+                previous_focus_path
+            } else {
+                Default::default()
+            },
+            current_focus_path: if current_window_active {
+                current_focus_path
+            } else {
+                Default::default()
+            },
+        };
+        self.focus_listeners
+            .clone()
+            .retain(&(), |listener| listener(&event, self, cx));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn snapshot_hitboxes_into_rendered_frame(&mut self) {
+        let fiber_tree = &self.fiber.tree;
+        snapshot_hitboxes_into_map(fiber_tree, &mut self.rendered_frame.hitboxes);
+        self.rendered_frame.hitboxes_epoch = Some(HitboxesSnapshotEpoch {
+            structure_epoch: fiber_tree.structure_epoch,
+            hitbox_epoch: fiber_tree.hitbox_epoch(),
+        });
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -2232,6 +3361,53 @@ impl Window {
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
+    #[cfg(debug_assertions)]
+    fn debug_assert_incremental_collections(&self) {
+        debug_assert_active_list_matches_map(
+            "tooltips",
+            &self.fiber.active_tooltips,
+            &self.fiber.tree.tooltips,
+        );
+        debug_assert_active_list_matches_map(
+            "cursor_styles",
+            &self.fiber.active_cursor_styles,
+            &self.fiber.tree.cursor_styles,
+        );
+        debug_assert_active_list_matches_map(
+            "deferred_draws",
+            &self.fiber.active_deferred_draws,
+            &self.fiber.tree.deferred_draws,
+        );
+        debug_assert_active_list_matches_map(
+            "input_handlers",
+            &self.fiber.active_input_handlers,
+            &self.fiber.tree.input_handlers,
+        );
+        for fiber_id in self.fiber.active_mouse_listeners.members.iter() {
+            let effects = self.fiber.tree.effects.get((*fiber_id).into());
+            // Get interactivity from render node
+            let interactivity = self
+                .fiber
+                .tree
+                .render_nodes
+                .get((*fiber_id).into())
+                .and_then(|node| node.interactivity());
+            debug_assert!(
+                has_mouse_effects(interactivity, effects),
+                "active mouse list contains fiber without mouse effects: {fiber_id:?}"
+            );
+        }
+        for (key, focus_ids) in self.fiber.tree.tab_stops.iter() {
+            let fiber_id = GlobalElementId::from(key);
+            for focus_id in focus_ids.iter() {
+                debug_assert!(
+                    self.fiber.rendered_tab_stops.contains(focus_id),
+                    "tab stop {focus_id:?} missing from rendered map for fiber {fiber_id:?}"
+                );
+            }
+        }
+    }
+
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
@@ -2242,14 +3418,314 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window
+            .draw(&self.rendered_frame.scene, &self.segment_pool);
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
 
+    const RENDER_LAYER_DEFERRED_DRAW_PRIORITY_BASE: usize = 1000;
+    const INSPECTOR_DEFERRED_DRAW_PRIORITY: usize = 2000;
+
+    fn global_overlay_owner_fiber(&mut self) -> GlobalElementId {
+        if let Some(fiber_id) = self.global_overlay_owner_fiber {
+            return fiber_id;
+        }
+
+        let fiber_id = self.fiber.tree.create_placeholder_fiber();
+        self.global_overlay_owner_fiber = Some(fiber_id);
+        fiber_id
+    }
+
+    fn reset_global_overlay_owner_deferred_draw_state(&mut self, fiber_id: GlobalElementId) {
+        self.fiber.tree.deferred_draws.remove(fiber_id.into());
+        self.fiber.active_deferred_draws.remove(&fiber_id);
+
+        if let Some(groups) = self
+            .fiber
+            .tree
+            .deferred_draw_overlay_groups
+            .get_mut(fiber_id.into())
+        {
+            for group in groups.values_mut() {
+                group.next_index = 0;
+            }
+        }
+    }
+
+    #[track_caller]
+    fn enqueue_render_layers_and_inspector(&mut self, root_size: Size<Pixels>, cx: &mut App) {
+        let owner_fiber = self.global_overlay_owner_fiber();
+        self.reset_global_overlay_owner_deferred_draw_state(owner_fiber);
+
+        let callsite = core::panic::Location::caller();
+        self.with_root_view_context(|window| {
+            if !window.render_layers.is_empty() {
+                let mut layers: Vec<(ElementId, i32, usize, RenderLayerBuilder)> = window
+                    .render_layers
+                    .iter()
+                    .map(|(key, reg)| (key.clone(), reg.order, reg.seq, reg.build.clone()))
+                    .collect();
+                layers.sort_by_key(|(_, order, seq, _)| (*order, *seq));
+
+                for (index, (key, _order, _seq, build)) in layers.into_iter().enumerate() {
+                    let mut hasher = FxHasher::default();
+                    key.hash(&mut hasher);
+                    let group_key = hasher.finish() as usize;
+
+                    let element = (&*build)(window, cx);
+                    window.fibers().defer_draw_for_fiber(
+                        owner_fiber,
+                        element,
+                        Point::default(),
+                        Self::RENDER_LAYER_DEFERRED_DRAW_PRIORITY_BASE + index,
+                        root_size.into(),
+                        group_key,
+                        callsite,
+                    );
+                }
+            }
+
+            #[cfg(any(feature = "inspector", debug_assertions))]
+            if let Some(inspector) = window.inspector.as_ref().cloned() {
+                let element = AnyView::from(inspector).into_any_element();
+                let inspector_width: Pixels = rems(30.0).to_pixels(window.rem_size());
+                let available_space = size(inspector_width, window.viewport_size.height).into();
+                let origin = point(window.viewport_size.width - inspector_width, px(0.0));
+                window.fibers().defer_draw_for_fiber(
+                    owner_fiber,
+                    element,
+                    origin,
+                    Self::INSPECTOR_DEFERRED_DRAW_PRIORITY,
+                    available_space,
+                    0,
+                    callsite,
+                );
+            }
+        });
+    }
+
+    fn with_root_view_context<R>(&mut self, f: impl FnOnce(&mut Window) -> R) -> R {
+        // Many elements expect to run under a rendering view context (e.g. image caches
+        // consult `Window::current_view()`), so ensure a view ID is present.
+        if let Some(root_view_id) = self.root.as_ref().map(|v| v.entity_id()) {
+            self.with_rendered_view(root_view_id, f)
+        } else {
+            f(self)
+        }
+    }
+
+    fn rebuild_scene_segment_order_if_needed(&mut self) {
+        let structure_epoch = self.fiber.tree.structure_epoch;
+        if self.next_frame.scene.segment_order_epoch() == structure_epoch {
+            return;
+        }
+        let order = self
+            .fiber
+            .tree
+            .root
+            .map(|root| self.fiber.tree.scene_segment_order(root))
+            .unwrap_or_default();
+        #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+        {
+            self.frame_diagnostics.segment_order_rebuilt = true;
+            self.frame_diagnostics.scene_segment_order_len = order.len();
+        }
+        self.next_frame
+            .scene
+            .set_segment_order(order, structure_epoch);
+    }
+
+    fn cleanup_removed_fibers(&mut self) {
+        let removed_tab_stops = self.fiber.tree.take_removed_tab_stops();
+        for (owner_id, focus_id) in removed_tab_stops {
+            self.fiber
+                .rendered_tab_stops
+                .remove_if_owned_by(&focus_id, owner_id);
+        }
+        for fiber_id in self.fiber.tree.take_removed_fibers() {
+            self.fiber.active_tooltips.remove(&fiber_id);
+            self.fiber.active_cursor_styles.remove(&fiber_id);
+            self.fiber.active_deferred_draws.remove(&fiber_id);
+            self.fiber.active_input_handlers.remove(&fiber_id);
+            self.fiber.active_mouse_listeners.remove(&fiber_id);
+            if let Some(transform_id) = self.scroll_transforms.remove(&fiber_id) {
+                self.segment_pool.transforms.remove(transform_id);
+            }
+        }
+    }
+
+    fn finalize_dirty_flags(&mut self) {
+        TaffyLayoutEngine::finalize_dirty_flags(self);
+    }
+
+    /// Reconcile the fiber tree against the current view state.
+    ///
+    /// This is the single entry point for all structure changes and node updates.
+    /// After this call, the fiber tree is stable and ready for layout/prepaint/paint.
+    ///
+    /// Returns `(structure_changed, root_fiber)` where `structure_changed` is true
+    /// when a full reconciliation occurred (Branch 3).
+    fn reconcile_frame(
+        &mut self,
+        root_size: Size<Pixels>,
+        cx: &mut App,
+    ) -> (bool, GlobalElementId) {
+        self.invalidator.set_phase(DrawPhase::Reconcile);
+
+        // Check for viewport change
+        let viewport_changed = self
+            .layout_engine
+            .last_layout_viewport_size
+            .is_none_or(|size| size != root_size);
+
+        // Branch 1: Root is completely clean with cached output - skip reconciliation
+        if !self.refreshing
+            && !viewport_changed
+            && self.fiber.tree.root.as_ref().is_some_and(|root_id| {
+                self.fiber.tree.get(root_id).is_some_and(|_| {
+                    self.fiber.tree.dirty_flags(root_id).is_subtree_clean()
+                        && self.fiber.tree.has_cached_output(root_id)
+                })
+            })
+        {
+            let root_fiber = self.fiber.tree.root.unwrap();
+            return (false, root_fiber);
+        }
+
+        // Branch 2: Root exists but has dirty views - expand views only
+        if !self.refreshing && !viewport_changed && self.fiber.tree.root.is_some() {
+            let root_fiber = self.fiber.tree.root.unwrap();
+
+            // Check if the root fiber itself is dirty and needs re-rendering.
+            // The root fiber doesn't have view_data, so expand_view_fibers skips it.
+            // We need to handle root view re-rendering here.
+            let root_needs_rerender = self.fiber.tree.dirty_flags(&root_fiber).needs_work();
+
+            if root_needs_rerender {
+                let root_view = self.root.as_ref().unwrap().clone();
+                let (mut root_element_tree, root_accessed_entities) =
+                    cx.detect_accessed_entities(|cx| {
+                        self.with_element_id_stack(&root_fiber, |window| {
+                            window.with_rendered_view(root_view.entity_id(), |window| {
+                                root_view.render_element(window, cx)
+                            })
+                        })
+                    });
+
+                self.hydrate_view_children(&mut root_element_tree);
+                self.record_pending_view_accesses(&root_fiber, root_accessed_entities);
+
+                // Reconcile the new element tree into the existing fiber structure
+                self.fiber
+                    .tree
+                    .reconcile_wrapper(&root_fiber, &root_element_tree, false);
+
+                // Update view_roots mapping for any new nested views
+                self.map_view_roots_from_element(&root_fiber, &root_element_tree, &mut Vec::new());
+
+                self.cache_fiber_payloads(&root_fiber, &mut root_element_tree, cx);
+            }
+
+            self.expand_view_fibers(root_fiber, cx);
+
+            return (false, root_fiber);
+        }
+
+        // Branch 3: Full reconciliation (first render, refreshing, or viewport changed)
+        let root_view = self.root.as_ref().unwrap().clone();
+        let root_fiber_scope = self
+            .fiber
+            .tree
+            .root
+            .filter(|fiber_id| self.fiber.tree.get(fiber_id).is_some())
+            .or_else(|| {
+                self.fiber
+                    .tree
+                    .get_view_root(root_view.entity_id())
+                    .filter(|fiber_id| self.fiber.tree.get(fiber_id).is_some())
+            })
+            .unwrap_or_else(|| self.ensure_view_root_fiber(root_view.entity_id()));
+        let (mut root_element_tree, root_accessed_entities) = cx.detect_accessed_entities(|cx| {
+            self.with_element_id_stack(&root_fiber_scope, |window| {
+                window.with_rendered_view(root_view.entity_id(), |window| {
+                    root_view.render_element(window, cx)
+                })
+            })
+        });
+
+        self.hydrate_view_children(&mut root_element_tree);
+
+        // Get or create root fiber.
+        //
+        // Prefer the existing `FiberTree.root` over `view_roots` because the window root view is
+        // rendered directly (not as an `AnyView` element), so the `view_roots` map is not always
+        // populated for it. Using `FiberTree.root` ensures state (e.g. scroll offsets) survives
+        // full refreshes triggered by transient UI events like mouse down/up.
+        let root_fiber = self
+            .fiber
+            .tree
+            .root
+            .filter(|fiber_id| self.fiber.tree.get(fiber_id).is_some())
+            .or_else(|| {
+                self.fiber
+                    .tree
+                    .get_view_root(root_view.entity_id())
+                    .filter(|fiber_id| self.fiber.tree.get(fiber_id).is_some())
+            })
+            .unwrap_or_else(|| self.fiber.tree.create_fiber_for(&root_element_tree));
+        let root_fiber = self.fiber.tree.ensure_root(&root_element_tree, root_fiber);
+
+        // Slow path: disable bailout to force full reconciliation with fresh constraints
+        self.fiber
+            .tree
+            .reconcile_wrapper(&root_fiber, &root_element_tree, false);
+        self.fiber.tree.view_roots.clear();
+        self.map_view_roots_from_element(&root_fiber, &root_element_tree, &mut Vec::new());
+        self.fiber
+            .tree
+            .set_view_root(root_view.entity_id(), root_fiber);
+
+        self.record_pending_view_accesses(&root_fiber, root_accessed_entities);
+
+        // Update last viewport size if it changed
+        if viewport_changed {
+            // Mark the root fiber as needing layout so the layout pass can track which fibers
+            // changed bounds under the new viewport constraints. This enables correct
+            // SIZE_CHANGED/POSITION_CHANGED propagation and prevents stale prepaint/paint replay
+            // (e.g. cached line layouts) across resizes.
+            //
+            // Also mark the root as needing paint so that we do a full-tree repaint on the first
+            // frame under a new viewport. This avoids replaying cached primitives that may depend
+            // on viewport-relative state (content masks, pixel alignment, platform surfaces) when
+            // the drawable size changes.
+            self.fiber.tree.mark_dirty(
+                &root_fiber,
+                DirtyFlags::NEEDS_LAYOUT | DirtyFlags::NEEDS_PAINT,
+            );
+            self.layout_engine.last_layout_viewport_size = Some(root_size);
+        }
+
+        self.cache_fiber_payloads(&root_fiber, &mut root_element_tree, cx);
+        self.expand_view_fibers(root_fiber, cx);
+
+        (true, root_fiber)
+    }
+
     fn draw_roots(&mut self, cx: &mut App) {
-        self.invalidator.set_phase(DrawPhase::Prepaint);
+        let frame_start = std::time::Instant::now();
         self.tooltip_bounds.take();
+        self.pending_view_accesses.clear();
+        self.fiber.frame_number = self.fiber.frame_number.wrapping_add(1);
+        self.fiber.tree.begin_frame(self.fiber.frame_number);
+        #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+        {
+            self.frame_diagnostics = FrameDiagnostics {
+                frame_number: self.fiber.frame_number,
+                structure_epoch: self.fiber.tree.structure_epoch,
+                ..Default::default()
+            };
+        }
 
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
         let root_size = {
@@ -2269,75 +3745,681 @@ impl Window {
             }
         };
 
-        // Layout all root elements.
-        let mut root_element = self.root.as_ref().unwrap().clone().into_any();
-        root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        // Phase 1: Reconcile (single entry point for all structure changes and node updates)
+        // reconcile_frame sets DrawPhase::Reconcile internally
+        let reconcile_start = std::time::Instant::now();
+        let (structure_changed, root_fiber) = self.reconcile_frame(root_size, cx);
+        self.full_reconciliation_this_frame = structure_changed;
+        #[cfg(any(test, feature = "test-support"))]
+        if structure_changed {
+            self.next_frame.debug_bounds.clear();
+        }
+        let reconcile_time = reconcile_start.elapsed();
 
-        #[cfg(any(feature = "inspector", debug_assertions))]
-        let inspector_element = self.prepaint_inspector(_inspector_width, cx);
+        // Phase 2: Intrinsic sizing
+        self.invalidator.set_phase(DrawPhase::Layout);
+        let sizing_start = std::time::Instant::now();
+        let any_size_changed = self.compute_intrinsic_sizes(root_fiber, cx);
+        let sizing_time = sizing_start.elapsed();
 
-        let mut sorted_deferred_draws =
-            (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
-        sorted_deferred_draws.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
-        self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
+        let dirty_islands = self.fiber.tree.collect_dirty_layout_islands();
 
-        let mut prompt_element = None;
-        let mut active_drag_element = None;
-        let mut tooltip_element = None;
-        if let Some(prompt) = self.prompt.take() {
-            let mut element = prompt.view.any_view().into_any();
-            element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
-            prompt_element = Some(element);
-            self.prompt = Some(prompt);
-        } else if let Some(active_drag) = cx.active_drag.take() {
-            let mut element = active_drag.view.clone().into_any();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
-            active_drag_element = Some(element);
-            cx.active_drag = Some(active_drag);
+        // Layout is needed if:
+        // - Any island has explicit layout dirtiness (position/style/structure), or
+        // - Intrinsic sizing determined any intrinsic sizes actually changed.
+        let needs_layout = any_size_changed || !dirty_islands.is_empty();
+
+        // Phase 3: Layout (if needed)
+        let layout_start = std::time::Instant::now();
+        let layout_fibers = if needs_layout {
+            self.invalidator.set_phase(DrawPhase::Layout);
+            self.compute_layout_islands(root_fiber, root_size.into(), &dirty_islands, cx)
         } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            0
+        };
+
+        if needs_layout {
+            self.finalize_dirty_flags();
+        }
+        let layout_time = layout_start.elapsed();
+
+        // Phase 4: Prepaint
+        let prepaint_start = std::time::Instant::now();
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        self.with_absolute_element_offset(Point::default(), |window| {
+            context::PrepaintCx::new(window).prepaint_fiber_tree(root_fiber, cx)
+        });
+        self.enqueue_render_layers_and_inspector(root_size, cx);
+
+        let mut deferred_draws = {
+            let mut prepaint_cx = context::PrepaintCx::new(self);
+            prepaint_cx.collect_deferred_draw_keys()
+        };
+        deferred_draws.sort_by_key(|draw| (draw.priority, draw.sequence));
+        {
+            let mut prepaint_cx = context::PrepaintCx::new(self);
+            prepaint_cx.prepaint_deferred_draws(&deferred_draws, cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        // Clear active overlay from previous frame.
+        self.active_overlay = None;
 
-        // Now actually paint the elements.
+        // Prepaint overlays in priority order: prompt > drag > tooltip.
+        // Only one can be active at a time. All use fiber-backed rendering.
+        let has_overlay = self.prepaint_prompt(root_size, cx)
+            || self.prepaint_active_drag(cx)
+            || self.prepaint_tooltip(cx);
+
+        self.mouse_hit_test = self.next_frame.hit_test(self, self.mouse_position);
+        let prepaint_time = prepaint_start.elapsed();
+
+        // Dispatch queued on_layout events after all prepaint passes.
+        self.dispatch_layout_events(cx);
+
+        // Phase 5: Paint
+        let paint_start = std::time::Instant::now();
+        self.fiber.tree.ensure_preorder_indices();
         self.invalidator.set_phase(DrawPhase::Paint);
-        root_element.paint(self, cx);
+        context::PaintCx::new(self).paint_fiber_tree(root_fiber, cx);
 
-        #[cfg(any(feature = "inspector", debug_assertions))]
-        self.paint_inspector(inspector_element, cx);
+        {
+            let mut paint_cx = context::PaintCx::new(self);
+            paint_cx.paint_deferred_draws(&deferred_draws, cx);
+        }
 
-        self.paint_deferred_draws(&sorted_deferred_draws, cx);
-
-        if let Some(mut prompt_element) = prompt_element {
-            prompt_element.paint(self, cx);
-        } else if let Some(mut drag_element) = active_drag_element {
-            drag_element.paint(self, cx);
-        } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
+        if has_overlay {
+            // Paint fiber-backed overlay (prompt, drag, or tooltip).
+            self.paint_overlay(cx);
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+        let paint_time = paint_start.elapsed();
+
+	        // Phase 6: Cleanup
+	        // Clear work flags and properly recompute HAS_DIRTY_DESCENDANT.
+	        // This ensures fibers are in a clean state for the next frame's caching decisions.
+	        let cleanup_start = std::time::Instant::now();
+	        self.fiber.tree.log_dirty_touched_summary_if_enabled();
+	        self.fiber.tree.end_of_frame_cleanup();
+	        let cleanup_time = cleanup_start.elapsed();
+	        let total_time = frame_start.elapsed();
+
+        #[cfg(any(debug_assertions, feature = "diagnostics", feature = "test-support"))]
+        {
+            self.frame_diagnostics.layout_fibers = layout_fibers;
+            self.frame_diagnostics.reconcile_time = reconcile_time;
+            self.frame_diagnostics.intrinsic_sizing_time = sizing_time;
+            self.frame_diagnostics.layout_time = layout_time;
+            self.frame_diagnostics.prepaint_time = prepaint_time;
+            self.frame_diagnostics.paint_time = paint_time;
+            self.frame_diagnostics.cleanup_time = cleanup_time;
+            self.frame_diagnostics.total_time = total_time;
+        }
+        #[cfg(not(any(debug_assertions, feature = "diagnostics", feature = "test-support")))]
+        let _ = layout_fibers;
     }
 
-    fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
-        // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
-        for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
-            let Some(Some(tooltip_request)) = self
-                .next_frame
-                .tooltip_requests
-                .get(tooltip_request_index)
-                .cloned()
-            else {
-                log::error!("Unexpectedly absent TooltipRequest");
+    /// Phase 2: Compute intrinsic sizes for dirty elements.
+    ///
+    /// Returns true if any fiber's computed intrinsic size changed.
+    fn compute_intrinsic_sizes(&mut self, root_fiber: GlobalElementId, cx: &mut App) -> bool {
+        let _ = root_fiber;
+        self.compute_intrinsic_sizes_for_islands(
+            cx,
+            |_, _| true,
+            true,
+            None,
+            false,
+        )
+    }
+
+    fn compute_intrinsic_sizes_for_islands<F>(
+        &mut self,
+        cx: &mut App,
+        mut include_island: F,
+        track_processed_islands: bool,
+        detached_root: Option<GlobalElementId>,
+        force_compute: bool,
+    ) -> bool
+    where
+        F: FnMut(&crate::FiberTree, GlobalElementId) -> bool,
+    {
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        let mut any_changed = false;
+        let options = IntrinsicSizingOptions {
+            track_processed_islands,
+            convergence_root: detached_root,
+            force_compute,
+        };
+
+	        #[derive(Clone, Copy)]
+	        struct StackState {
+	            text_style_len: usize,
+	            image_cache_len: usize,
+	            rendered_entity_len: usize,
+	        }
+
+	        impl StackState {
+	            fn capture(window: &Window) -> Self {
+	                Self {
+	                    text_style_len: window.text_style_stack.len(),
+	                    image_cache_len: window.image_cache_stack.len(),
+	                    rendered_entity_len: window.rendered_entity_stack.len(),
+	                }
+	            }
+
+	            fn restore(self, window: &mut Window) {
+	                window.text_style_stack.truncate(self.text_style_len);
+	                window.image_cache_stack.truncate(self.image_cache_len);
+	                window
+	                    .rendered_entity_stack
+	                    .truncate(self.rendered_entity_len);
+	            }
+	        }
+
+	        struct Frame {
+	            fiber_id: GlobalElementId,
+	            dirty: DirtyFlags,
+	            stack_state: StackState,
+	            node_frame: Option<crate::LayoutFrame>,
+	        }
+
+        if options.track_processed_islands {
+            self.fiber.tree.sizing_pass_processed_islands.clear();
+        }
+
+	        let mut processed_islands: collections::FxHashSet<GlobalElementId> =
+	            collections::FxHashSet::default();
+	        let mut iterations = 0usize;
+
+	        loop {
+            iterations += 1;
+            if iterations >= 32 {
+                if let Some(root) = options.convergence_root {
+                    log::error!(
+                        "detached intrinsic sizing did not converge for root {:?}",
+                        root
+                    );
+                } else {
+	                    log::error!("conditional slot reconciliation did not converge");
+	                }
+	                break;
+            }
+
+            self.fiber.tree.rebuild_layout_islands_if_needed();
+            let island_roots: Vec<GlobalElementId> =
+                self.fiber.tree.layout_island_roots().to_vec();
+
+            let dirty_layout_islands = self.fiber.tree.collect_dirty_layout_islands();
+            let dirty_sizing_islands = self.fiber.tree.collect_dirty_sizing_islands();
+
+            let mut islands_to_process: collections::FxHashSet<GlobalElementId> = if options
+                .force_compute
+            {
+                island_roots
+                    .iter()
+                    .copied()
+                    .filter(|island_root| include_island(&self.fiber.tree, *island_root))
+                    .collect()
+            } else {
+                let mut islands_to_process = dirty_layout_islands.clone();
+                islands_to_process.extend(dirty_sizing_islands);
+                islands_to_process.retain(|island_root| include_island(&self.fiber.tree, *island_root));
+                islands_to_process
+            };
+            islands_to_process.retain(|island_root| !processed_islands.contains(island_root));
+            if islands_to_process.is_empty() {
+                break;
+            }
+
+            for island_root in island_roots.into_iter().rev() {
+                if !islands_to_process.contains(&island_root) {
+                    continue;
+                }
+	                if self.fiber.tree.get(&island_root).is_none() {
+	                    continue;
+	                }
+
+                processed_islands.insert(island_root);
+                if options.track_processed_islands {
+                    self.fiber
+                        .tree
+                        .sizing_pass_processed_islands
+                        .insert(island_root);
+                }
+
+	                let mut stack: Vec<(GlobalElementId, bool)> = vec![(island_root, true)];
+	                let mut frame_stack: Vec<Frame> = Vec::new();
+
+	                while let Some((fiber_id, entering)) = stack.pop() {
+	                    if entering {
+	                        let view_id = {
+	                            let Some(fiber) = self.fiber.tree.get(&fiber_id) else {
+	                                continue;
+	                            };
+	                            self.fiber_view_id(&fiber_id, fiber)
+	                        };
+
+	                        let dirty = self.fiber.tree.dirty_flags(&fiber_id);
+	                        let stack_state = StackState::capture(self);
+	                        let structure_epoch_before = self.fiber.tree.structure_epoch;
+	                        let mut node_frame: Option<crate::LayoutFrame> = None;
+
+	                        if let Some(view_id) = view_id {
+	                            self.rendered_entity_stack.push(view_id);
+	                        }
+
+	                        let _ = self.with_render_node_mut(fiber_id, |node, window| {
+	                            let mut layout_ctx = crate::LayoutCtx {
+	                                fiber_id,
+	                                rem_size,
+	                                scale_factor,
+	                                window,
+	                                cx,
+	                            };
+	                            let frame = node.layout_begin(&mut layout_ctx);
+
+	                            let slots = node.conditional_slots(fiber_id);
+	                            let had_node_children = window
+	                                .fiber
+	                                .tree
+	                                .node_children
+	                                .get(fiber_id.into())
+	                                .is_some_and(|children| !children.is_empty());
+	                            if !slots.is_empty() || had_node_children {
+	                                let structure_epoch_before = window.fiber.tree.structure_epoch;
+	                                window.reconcile_conditional_slots(fiber_id, slots, cx);
+	                                if window.fiber.tree.structure_epoch != structure_epoch_before {
+	                                    window.fiber.tree.rebuild_layout_islands_if_needed();
+	                                }
+	                            }
+
+	                            node_frame = Some(frame);
+	                        });
+
+	                        if self.fiber.tree.structure_epoch != structure_epoch_before {
+	                            self.fiber.tree.rebuild_layout_islands_if_needed();
+	                        }
+
+                        frame_stack.push(Frame {
+                            fiber_id,
+                            dirty,
+	                            stack_state,
+	                            node_frame,
+	                        });
+	                        stack.push((fiber_id, false));
+
+	                        let children: SmallVec<[GlobalElementId; 8]> =
+	                            self.fiber.tree.children(&fiber_id).collect();
+	                        for child_id in children.into_iter().rev() {
+	                            if self.fiber.tree.outer_island_root_for(child_id) == island_root {
+	                                stack.push((child_id, true));
+	                            }
+	                        }
+	                    } else {
+	                        let Some(frame) = frame_stack.pop() else {
+	                            continue;
+                        };
+                        debug_assert_eq!(frame.fiber_id, fiber_id);
+
+                        if (options.force_compute || frame.dirty.needs_sizing())
+                            && self.compute_fiber_intrinsic_size(
+                                fiber_id,
+                                rem_size,
+                                scale_factor,
+                                cx,
+	                            )
+	                        {
+	                            any_changed = true;
+                            self.fiber.tree.mark_intrinsic_size_changed(&fiber_id);
+                        }
+
+                        if frame.dirty.has_sizing_work() {
+                            self.fiber.tree.clear_sizing_flags(&fiber_id);
+                        }
+
+                        if let Some(node_frame) = frame.node_frame {
+                            let _ = self.with_render_node_mut(fiber_id, |node, window| {
+                                let mut layout_ctx = crate::LayoutCtx {
+                                    fiber_id,
+                                    rem_size,
+                                    scale_factor,
+                                    window,
+                                    cx,
+                                };
+                                node.layout_end(&mut layout_ctx, node_frame);
+                            });
+                        }
+
+                        frame.stack_state.restore(self);
+                    }
+                }
+            }
+	        }
+
+	        any_changed
+	    }
+
+	    fn reconcile_conditional_slots(
+	        &mut self,
+	        parent_id: GlobalElementId,
+	        slots: SmallVec<[crate::ConditionalSlot; 4]>,
+        cx: &mut App,
+    ) {
+        let parent_key: DefaultKey = parent_id.into();
+        let old_node_children = self
+            .fiber
+            .tree
+            .node_children
+            .get(parent_key)
+            .cloned()
+            .unwrap_or_default();
+
+        let existing_children: SmallVec<[GlobalElementId; 8]> =
+            SmallVec::from_slice(self.fiber.tree.children_slice(&parent_id));
+
+        let mut descriptor_children: SmallVec<[GlobalElementId; 8]> = SmallVec::new();
+        for child_id in &existing_children {
+            if !old_node_children.contains(child_id) {
+                descriptor_children.push(*child_id);
+            }
+        }
+
+        let mut new_node_children: SmallVec<[GlobalElementId; 4]> = SmallVec::new();
+        for slot in slots {
+            if !slot.active {
+                continue;
+            }
+
+            let existing_child_id = old_node_children.iter().copied().find(|candidate_id| {
+                self.fiber
+                    .tree
+                    .get(candidate_id)
+                    .is_some_and(|fiber| fiber.slot_index == Some(slot.slot_index))
+                    && !new_node_children.contains(candidate_id)
+            });
+
+            let Some(element_factory) = slot.element_factory else {
+                if let Some(child_id) = existing_child_id {
+                    self.fiber.tree.set_parent(&child_id, &parent_id);
+                    new_node_children.push(child_id);
+                }
                 continue;
             };
+
+            let child_id = existing_child_id.unwrap_or_else(|| {
+                let child_id = self.fiber.tree.create_placeholder_fiber();
+                if let Some(fiber) = self.fiber.tree.get_mut(&child_id) {
+                    fiber.slot_index = Some(slot.slot_index);
+                }
+                child_id
+            });
+
+            self.fiber.tree.set_parent(&child_id, &parent_id);
+
+            let mut element = element_factory();
+            element.expand_wrappers(self, cx);
+            self.fiber.tree.reconcile_wrapper(&child_id, &element, true);
+            self.fibers()
+                .cache_fiber_payloads_overlay(&child_id, &mut element, cx);
+
+            new_node_children.push(child_id);
+        }
+
+        for child_id in old_node_children.iter() {
+            if new_node_children.contains(child_id) {
+                continue;
+            }
+            if self.fiber.tree.get(child_id).is_some() {
+                self.fiber.tree.remove(child_id);
+            }
+        }
+
+        if let Some(stored) = self.fiber.tree.node_children.get_mut(parent_key) {
+            *stored = new_node_children.clone();
+        } else {
+            self.fiber
+                .tree
+                .node_children
+                .insert(parent_key, new_node_children.clone());
+        }
+
+        let mut merged_children = descriptor_children;
+        merged_children.extend(new_node_children);
+
+        if existing_children != merged_children {
+            self.fiber
+                .tree
+                .relink_children_in_order(&parent_id, &merged_children);
+            self.fiber.tree.clear_taffy_cache_upwards(&parent_id);
+            self.fiber.tree.mark_dirty(
+                &parent_id,
+                DirtyFlags::STRUCTURE_CHANGED | DirtyFlags::NEEDS_LAYOUT | DirtyFlags::NEEDS_PAINT,
+            );
+        }
+    }
+
+    fn compute_layout_islands(
+        &mut self,
+        root_fiber: GlobalElementId,
+        root_space: Size<AvailableSpace>,
+        dirty_islands: &collections::FxHashSet<GlobalElementId>,
+        cx: &mut App,
+    ) -> usize {
+        self.fiber.tree.rebuild_layout_islands_if_needed();
+
+        // Update taffy styles and run layout for dirty islands only.
+        self.layout_engine.fibers_layout_changed.clear();
+        let island_roots: Vec<GlobalElementId> = self.fiber.tree.layout_island_roots().to_vec();
+
+        let mut layout_calls = 0;
+        let scale_factor = self.scale_factor();
+
+        for island_root in &island_roots {
+            if !dirty_islands.contains(island_root) {
+                continue;
+            }
+
+            let available_space = if *island_root == root_fiber {
+                root_space
+            } else if self.fiber.tree.parent(island_root).is_some() {
+                // For internal islands (layout boundaries), use the island root's *current* bounds
+                // from the already-computed outer layout. Using `tree.bounds` here is incorrect
+                // because it is only updated after the full island pass, which can leave inner
+                // islands laid out with stale (or missing) constraints.
+                let layout = self.fiber.tree.final_layout_for_bounds(*island_root);
+                Size {
+                    width: AvailableSpace::Definite(Pixels(layout.size.width / scale_factor)),
+                    height: AvailableSpace::Definite(Pixels(layout.size.height / scale_factor)),
+                }
+            } else if let Some(bounds) = self.fiber.tree.bounds.get((*island_root).into()).copied()
+            {
+                Size {
+                    width: AvailableSpace::Definite(bounds.size.width),
+                    height: AvailableSpace::Definite(bounds.size.height),
+                }
+            } else {
+                // Fallback for first layout of detached roots. Use min-size constraints.
+                AvailableSpace::min_size()
+            };
+
+            TaffyLayoutEngine::setup_taffy_from_fibers(self, *island_root, cx);
+            layout_calls += self.compute_layout_for_fiber(*island_root, available_space, cx);
+        }
+
+        layout_calls
+    }
+
+    /// Compute intrinsic sizes and reconcile conditional slots for a detached root.
+    ///
+    /// This is used for test/overlay subtrees that perform their own layout pass (outside the main
+    /// window frame pipeline). It ensures retained nodes can materialize conditional-slot children
+    /// and all fibers in the detached subtree have cached intrinsic sizes before taffy layout runs.
+    pub(crate) fn compute_intrinsic_sizes_for_detached_root(
+        &mut self,
+        root: GlobalElementId,
+        cx: &mut App,
+    ) {
+	        fn is_descendant_of(
+	            tree: &crate::FiberTree,
+	            mut fiber_id: GlobalElementId,
+	            root: GlobalElementId,
+	        ) -> bool {
+	            loop {
+	                if fiber_id == root {
+	                    return true;
+	                }
+	                let Some(parent_id) = tree.parent(&fiber_id) else {
+	                    return false;
+	                };
+	                fiber_id = parent_id;
+	            }
+	        }
+        let _ = self.compute_intrinsic_sizes_for_islands(
+            cx,
+            |tree, island_root| is_descendant_of(tree, island_root, root),
+            false,
+            Some(root),
+            false,
+        );
+    }
+
+    fn compute_fiber_intrinsic_size(
+        &mut self,
+        fiber_id: GlobalElementId,
+        rem_size: Pixels,
+        scale_factor: f32,
+        cx: &mut App,
+    ) -> bool {
+        let slot_key: DefaultKey = fiber_id.into();
+
+        let mut render_node = self.fiber.tree.render_nodes.remove(slot_key);
+        if render_node
+            .as_ref()
+            .is_some_and(|node| !node.uses_intrinsic_sizing_cache())
+        {
+            log::trace!(
+                "clear_intrinsic_size {:?}: render_node doesn't use intrinsic sizing cache",
+                fiber_id
+            );
+            if let Some(layout_state) = self.fiber.tree.layout_state.get_mut(slot_key) {
+                layout_state.intrinsic_size = None;
+            }
+            if let Some(node) = render_node {
+                self.fiber.tree.render_nodes.insert(slot_key, node);
+            }
+            return false;
+        }
+
+        let result = if let Some(ref mut node) = render_node {
+            let mut ctx = crate::SizingCtx {
+                fiber_id,
+                window: self,
+                cx,
+                rem_size,
+                scale_factor,
+            };
+            Some(node.compute_intrinsic_size(&mut ctx))
+        } else {
+            None
+        };
+
+        if let Some(node) = render_node {
+            self.fiber.tree.render_nodes.insert(slot_key, node);
+        }
+
+        let Some(result) = result else {
+            return false;
+        };
+
+        let cached = self.fiber.tree.get_intrinsic_size(&fiber_id);
+        let changed = cached.map(|c| c.size != result.size).unwrap_or(true);
+
+        self.fiber.tree.set_intrinsic_size(&fiber_id, result.size);
+
+        changed
+    }
+
+    /// Paint the active fiber-backed overlay (tooltip, prompt, or drag).
+    fn paint_overlay(&mut self, cx: &mut App) {
+        let Some(overlay) = self.active_overlay else {
+            return;
+        };
+
+        self.with_rendered_view(overlay.view_id, |window| {
+            let mut paint_cx = context::PaintCx::new(window);
+            paint_cx.with_absolute_element_offset(overlay.offset, |window| {
+                window
+                    .fibers()
+                    .paint_fiber_tree_internal(overlay.fiber_id, cx, true)
+            });
+        });
+    }
+
+    /// Dispatch queued on_layout events to their listeners.
+    ///
+    /// Called after all prepaint passes, before paint. Events are queued during prepaint
+    /// when a fiber's bounds change and it has a layout listener.
+    fn dispatch_layout_events(&mut self, cx: &mut App) {
+        let events = std::mem::take(&mut self.fiber.pending_layout_events);
+        for (fiber_id, bounds) in events {
+            let fiber_key = fiber_id.into();
+            if let Some(mut listener) = self.fiber.tree.layout_listeners.remove(fiber_key) {
+                // If the listener panics, we still want to restore it into the map so that
+                // debugging does not lose the registration.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    listener(bounds, self, cx);
+                }));
+                self.fiber.tree.layout_listeners.insert(fiber_key, listener);
+                if let Err(payload) = result {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
+
+    fn prepaint_tooltip(&mut self, cx: &mut App) -> bool {
+        let tooltip_requests = self.fibers().collect_tooltip_requests();
+        for tooltip_request in tooltip_requests.into_iter().rev() {
             let mut element = tooltip_request.tooltip.view.clone().into_any();
             let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+            let current_view = self.current_view();
 
+            // Get or create the tooltip fiber root.
+            let fiber_id = if let Some(existing) = self.fiber.tooltip_overlay_root {
+                existing
+            } else {
+                let new_root = self.fiber.tree.create_placeholder_fiber();
+                self.fiber.tooltip_overlay_root = Some(new_root);
+                new_root
+            };
+
+            // Expand wrapper elements BEFORE reconciliation.
+            element.expand_wrappers(self, cx);
+
+            // Reconcile the tooltip element into the fiber.
+            self.fiber.tree.reconcile(&fiber_id, &element, true);
+
+            // Install retained nodes.
+            self.fibers()
+                .cache_fiber_payloads_overlay(&fiber_id, &mut element, cx);
+
+            // Layout the tooltip using min-size constraints.
+            self.prepare_detached_root_for_layout(fiber_id, cx);
+            self.compute_layout_for_fiber(fiber_id, AvailableSpace::min_size(), cx);
+
+            // Get the computed size from the fiber bounds.
+            let tooltip_size = self
+                .fiber
+                .tree
+                .bounds
+                .get(fiber_id.into())
+                .map(|b| b.size)
+                .unwrap_or_default();
+
+            // Position the tooltip.
             let mut tooltip_bounds =
                 Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
             let window_bounds = Bounds {
@@ -2369,200 +4451,147 @@ impl Window {
                 }
             }
 
-            // It's possible for an element to have an active tooltip while not being painted (e.g.
-            // via the `visible_on_hover` method). Since mouse listeners are not active in this
-            // case, instead update the tooltip's visibility here.
+            // Check visibility.
             let is_visible =
                 (tooltip_request.tooltip.check_visible_and_update)(tooltip_bounds, self, cx);
             if !is_visible {
                 continue;
             }
 
-            self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
-                element.prepaint(window, cx)
+            // Prepaint the fiber tree at the computed offset.
+            self.with_rendered_view(current_view, |window| {
+                let mut prepaint_cx = context::PrepaintCx::new(window);
+                prepaint_cx.with_absolute_element_offset(tooltip_bounds.origin, |window| {
+                    window
+                        .fibers()
+                        .prepaint_fiber_tree_internal(fiber_id, cx, true)
+                });
             });
 
+            // Store state for painting.
             self.tooltip_bounds = Some(TooltipBounds {
                 id: tooltip_request.id,
                 bounds: tooltip_bounds,
             });
-            return Some(element);
+            self.active_overlay = Some(ActiveOverlay {
+                fiber_id,
+                offset: tooltip_bounds.origin,
+                view_id: current_view,
+            });
+            return true;
         }
-        None
+        false
     }
 
-    fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
-        assert_eq!(self.element_id_stack.len(), 0);
+    /// Prepaint the prompt overlay using the fiber-backed pipeline.
+    /// Returns true if a prompt was prepainted.
+    fn prepaint_prompt(&mut self, root_size: Size<Pixels>, cx: &mut App) -> bool {
+        let Some(prompt) = self.prompt.take() else {
+            return false;
+        };
 
-        let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
-        for deferred_draw_ix in deferred_draw_indices {
-            let deferred_draw = &mut deferred_draws[*deferred_draw_ix];
-            self.element_id_stack
-                .clone_from(&deferred_draw.element_id_stack);
-            self.text_style_stack
-                .clone_from(&deferred_draw.text_style_stack);
-            self.next_frame
-                .dispatch_tree
-                .set_active_node(deferred_draw.parent_node);
+        let mut element = prompt.view.any_view().into_any();
+        let current_view = self.current_view();
 
-            let prepaint_start = self.prepaint_index();
-            if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                        element.prepaint(window, cx)
-                    });
-                })
-            } else {
-                self.reuse_prepaint(deferred_draw.prepaint_range.clone());
-            }
-            let prepaint_end = self.prepaint_index();
-            deferred_draw.prepaint_range = prepaint_start..prepaint_end;
-        }
-        assert_eq!(
-            self.next_frame.deferred_draws.len(),
-            0,
-            "cannot call defer_draw during deferred drawing"
-        );
-        self.next_frame.deferred_draws = deferred_draws;
-        self.element_id_stack.clear();
-        self.text_style_stack.clear();
+        // Get or create the prompt fiber root.
+        let fiber_id = if let Some(existing) = self.fiber.prompt_overlay_root {
+            existing
+        } else {
+            let new_root = self.fiber.tree.create_placeholder_fiber();
+            self.fiber.prompt_overlay_root = Some(new_root);
+            new_root
+        };
+
+        // Expand wrapper elements BEFORE reconciliation.
+        element.expand_wrappers(self, cx);
+
+        // Reconcile the prompt element into the fiber.
+        self.fiber.tree.reconcile(&fiber_id, &element, true);
+
+        // Install retained nodes.
+        self.fibers()
+            .cache_fiber_payloads_overlay(&fiber_id, &mut element, cx);
+
+        // Layout the prompt using root size constraints.
+        self.prepare_detached_root_for_layout(fiber_id, cx);
+        self.compute_layout_for_fiber(fiber_id, root_size.into(), cx);
+
+        // Prepaint the fiber tree at the origin.
+        self.with_rendered_view(current_view, |window| {
+            let mut prepaint_cx = context::PrepaintCx::new(window);
+            prepaint_cx.with_absolute_element_offset(Point::default(), |window| {
+                window
+                    .fibers()
+                    .prepaint_fiber_tree_internal(fiber_id, cx, true)
+            });
+        });
+
+        // Store state for painting.
+        self.active_overlay = Some(ActiveOverlay {
+            fiber_id,
+            offset: Point::default(),
+            view_id: current_view,
+        });
+
+        // Restore the prompt.
+        self.prompt = Some(prompt);
+        true
     }
 
-    fn paint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
-        assert_eq!(self.element_id_stack.len(), 0);
+    /// Prepaint the active drag overlay using the fiber-backed pipeline.
+    /// Returns true if a drag was prepainted.
+    fn prepaint_active_drag(&mut self, cx: &mut App) -> bool {
+        let Some(active_drag) = cx.active_drag.take() else {
+            return false;
+        };
 
-        let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
-        for deferred_draw_ix in deferred_draw_indices {
-            let mut deferred_draw = &mut deferred_draws[*deferred_draw_ix];
-            self.element_id_stack
-                .clone_from(&deferred_draw.element_id_stack);
-            self.next_frame
-                .dispatch_tree
-                .set_active_node(deferred_draw.parent_node);
+        let mut element = active_drag.view.clone().into_any();
+        let offset = self.mouse_position() - active_drag.cursor_offset;
+        let current_view = self.current_view();
 
-            let paint_start = self.paint_index();
-            if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    element.paint(window, cx);
-                })
-            } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
-            }
-            let paint_end = self.paint_index();
-            deferred_draw.paint_range = paint_start..paint_end;
-        }
-        self.next_frame.deferred_draws = deferred_draws;
-        self.element_id_stack.clear();
-    }
+        // Get or create the drag fiber root.
+        let fiber_id = if let Some(existing) = self.fiber.drag_overlay_root {
+            existing
+        } else {
+            let new_root = self.fiber.tree.create_placeholder_fiber();
+            self.fiber.drag_overlay_root = Some(new_root);
+            new_root
+        };
 
-    pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
-        PrepaintStateIndex {
-            hitboxes_index: self.next_frame.hitboxes.len(),
-            tooltips_index: self.next_frame.tooltip_requests.len(),
-            deferred_draws_index: self.next_frame.deferred_draws.len(),
-            dispatch_tree_index: self.next_frame.dispatch_tree.len(),
-            accessed_element_states_index: self.next_frame.accessed_element_states.len(),
-            line_layout_index: self.text_system.layout_index(),
-        }
-    }
+        // Expand wrapper elements BEFORE reconciliation.
+        element.expand_wrappers(self, cx);
 
-    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .cloned(),
-        );
-        self.next_frame.tooltip_requests.extend(
-            self.rendered_frame.tooltip_requests
-                [range.start.tooltips_index..range.end.tooltips_index]
-                .iter_mut()
-                .map(|request| request.take()),
-        );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        // Reconcile the drag element into the fiber.
+        self.fiber.tree.reconcile(&fiber_id, &element, true);
 
-        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
-            range.start.dispatch_tree_index..range.end.dispatch_tree_index,
-            &mut self.rendered_frame.dispatch_tree,
-            self.focus,
-        );
+        // Install retained nodes.
+        self.fibers()
+            .cache_fiber_payloads_overlay(&fiber_id, &mut element, cx);
 
-        if reused_subtree.contains_focus() {
-            self.next_frame.focus = self.focus;
-        }
+        // Layout the drag using min-size constraints.
+        self.prepare_detached_root_for_layout(fiber_id, cx);
+        self.compute_layout_for_fiber(fiber_id, AvailableSpace::min_size(), cx);
 
-        self.next_frame.deferred_draws.extend(
-            self.rendered_frame.deferred_draws
-                [range.start.deferred_draws_index..range.end.deferred_draws_index]
-                .iter()
-                .map(|deferred_draw| DeferredDraw {
-                    current_view: deferred_draw.current_view,
-                    parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
-                    element_id_stack: deferred_draw.element_id_stack.clone(),
-                    text_style_stack: deferred_draw.text_style_stack.clone(),
-                    priority: deferred_draw.priority,
-                    element: None,
-                    absolute_offset: deferred_draw.absolute_offset,
-                    prepaint_range: deferred_draw.prepaint_range.clone(),
-                    paint_range: deferred_draw.paint_range.clone(),
-                }),
-        );
-    }
+        // Prepaint the fiber tree at the computed offset.
+        self.with_rendered_view(current_view, |window| {
+            let mut prepaint_cx = context::PrepaintCx::new(window);
+            prepaint_cx.with_absolute_element_offset(offset, |window| {
+                window
+                    .fibers()
+                    .prepaint_fiber_tree_internal(fiber_id, cx, true)
+            });
+        });
 
-    pub(crate) fn paint_index(&self) -> PaintIndex {
-        PaintIndex {
-            scene_index: self.next_frame.scene.len(),
-            mouse_listeners_index: self.next_frame.mouse_listeners.len(),
-            input_handlers_index: self.next_frame.input_handlers.len(),
-            cursor_styles_index: self.next_frame.cursor_styles.len(),
-            accessed_element_states_index: self.next_frame.accessed_element_states.len(),
-            tab_handle_index: self.next_frame.tab_stops.paint_index(),
-            line_layout_index: self.text_system.layout_index(),
-        }
-    }
+        // Store state for painting.
+        self.active_overlay = Some(ActiveOverlay {
+            fiber_id,
+            offset,
+            view_id: current_view,
+        });
 
-    pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
-        self.next_frame.cursor_styles.extend(
-            self.rendered_frame.cursor_styles
-                [range.start.cursor_styles_index..range.end.cursor_styles_index]
-                .iter()
-                .cloned(),
-        );
-        self.next_frame.input_handlers.extend(
-            self.rendered_frame.input_handlers
-                [range.start.input_handlers_index..range.end.input_handlers_index]
-                .iter_mut()
-                .map(|handler| handler.take()),
-        );
-        self.next_frame.mouse_listeners.extend(
-            self.rendered_frame.mouse_listeners
-                [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
-                .iter_mut()
-                .map(|listener| listener.take()),
-        );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
-        self.next_frame.tab_stops.replay(
-            &self.rendered_frame.tab_stops.insertion_history
-                [range.start.tab_handle_index..range.end.tab_handle_index],
-        );
-
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
+        // Restore the active drag.
+        cx.active_drag = Some(active_drag);
+        true
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -2575,7 +4604,7 @@ impl Window {
     where
         F: FnOnce(&mut Self) -> R,
     {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
         if let Some(style) = style {
             self.text_style_stack.push(style);
             let result = f(self);
@@ -2590,10 +4619,7 @@ impl Window {
     /// during the paint phase of element drawing.
     pub fn set_cursor_style(&mut self, style: CursorStyle, hitbox: &Hitbox) {
         self.invalidator.debug_assert_paint();
-        self.next_frame.cursor_styles.push(CursorStyleRequest {
-            hitbox_id: Some(hitbox.id),
-            style,
-        });
+        self.fibers().set_cursor_style(style, hitbox);
     }
 
     /// Updates the cursor style for the entire window at the platform level. A cursor
@@ -2602,21 +4628,14 @@ impl Window {
     /// phase of element drawing.
     pub fn set_window_cursor_style(&mut self, style: CursorStyle) {
         self.invalidator.debug_assert_paint();
-        self.next_frame.cursor_styles.push(CursorStyleRequest {
-            hitbox_id: None,
-            style,
-        })
+        self.with_fiber_cx(|fiber| fiber.set_window_cursor_style(style));
     }
 
     /// Sets a tooltip to be rendered for the upcoming frame. This method should only be called
     /// during the paint phase of element drawing.
     pub fn set_tooltip(&mut self, tooltip: AnyTooltip) -> TooltipId {
-        self.invalidator.debug_assert_prepaint();
-        let id = TooltipId(post_inc(&mut self.next_tooltip_id.0));
-        self.next_frame
-            .tooltip_requests
-            .push(Some(TooltipRequest { id, tooltip }));
-        id
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_fiber_cx(|fiber| fiber.set_tooltip(tooltip))
     }
 
     /// Invoke the given function with the given content mask after intersecting it
@@ -2629,10 +4648,12 @@ impl Window {
         mask: Option<ContentMask<Pixels>>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
-            self.content_mask_stack.push(mask);
+            // Transform mask to world coordinates if inside a transform context
+            let world_mask = self.transform_mask_to_world(mask);
+            let intersected = world_mask.intersect(&self.content_mask());
+            self.content_mask_stack.push(intersected);
             let result = f(self);
             self.content_mask_stack.pop();
             result
@@ -2642,13 +4663,13 @@ impl Window {
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement
-    /// scrolling. This method should only be called during the prepaint phase of element drawing.
+    /// scrolling. This method should only be called during element drawing.
     pub fn with_element_offset<R>(
         &mut self,
         offset: Point<Pixels>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.invalidator.debug_assert_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
 
         if offset.is_zero() {
             return f(self);
@@ -2660,25 +4681,45 @@ impl Window {
 
     /// Updates the global element offset based on the given offset. This is used to implement
     /// drag handles and other manual painting of elements. This method should only be called during
-    /// the prepaint phase of element drawing.
+    /// element drawing.
     pub fn with_absolute_element_offset<R>(
         &mut self,
         offset: Point<Pixels>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.invalidator.debug_assert_prepaint();
-        self.element_offset_stack.push(offset);
+        self.invalidator.debug_assert_prepaint_or_paint();
+        let current = self.element_offset();
+        let delta = offset - current;
+        self.transform_stack.push_offset(delta);
         let result = f(self);
-        self.element_offset_stack.pop();
+        self.transform_stack.pop_offset(delta);
         result
     }
 
-    pub(crate) fn with_element_opacity<R>(
+    pub(crate) fn push_unculled_scene(&mut self) {
+        self.scene_culling_disabled_depth = self.scene_culling_disabled_depth.saturating_add(1);
+    }
+
+    pub(crate) fn pop_unculled_scene(&mut self) {
+        self.scene_culling_disabled_depth = self.scene_culling_disabled_depth.saturating_sub(1);
+    }
+
+    pub(crate) fn should_cull_scene_primitives(&self) -> bool {
+        self.scene_culling_disabled_depth == 0
+    }
+
+    /// Executes the given closure with an additional element opacity multiplier.
+    ///
+    /// This is used to implement inherited opacity for custom elements that paint directly
+    /// via window APIs.
+    ///
+    /// This method should only be called during the prepaint or paint phase of element drawing.
+    pub fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
 
         let Some(opacity) = opacity else {
             return f(self);
@@ -2697,26 +4738,8 @@ impl Window {
     /// element offset and prepaint again. See [`crate::List`] for an example. This method should only be
     /// called during the prepaint phase of element drawing.
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
-        self.invalidator.debug_assert_prepaint();
-        let index = self.prepaint_index();
-        let result = f(self);
-        if result.is_err() {
-            self.next_frame.hitboxes.truncate(index.hitboxes_index);
-            self.next_frame
-                .tooltip_requests
-                .truncate(index.tooltips_index);
-            self.next_frame
-                .deferred_draws
-                .truncate(index.deferred_draws_index);
-            self.next_frame
-                .dispatch_tree
-                .truncate(index.dispatch_tree_index);
-            self.next_frame
-                .accessed_element_states
-                .truncate(index.accessed_element_states_index);
-            self.text_system.truncate_layouts(index.line_layout_index);
-        }
-        result
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.fibers().transact(f)
     }
 
     /// When you call this method during [`Element::prepaint`], containing elements will attempt to
@@ -2725,14 +4748,14 @@ impl Window {
     /// that supports this method being called on the elements it contains. This method should only be
     /// called during the prepaint phase of element drawing.
     pub fn request_autoscroll(&mut self, bounds: Bounds<Pixels>) {
-        self.invalidator.debug_assert_prepaint();
+        self.invalidator.debug_assert_layout_or_prepaint();
         self.requested_autoscroll = Some(bounds);
     }
 
     /// This method can be called from a containing element such as [`crate::List`] to support the autoscroll behavior
     /// described in [`Self::request_autoscroll`].
     pub fn take_autoscroll(&mut self) -> Option<Bounds<Pixels>> {
-        self.invalidator.debug_assert_prepaint();
+        self.invalidator.debug_assert_layout_or_prepaint();
         self.requested_autoscroll.take()
     }
 
@@ -2750,7 +4773,6 @@ impl Window {
                     let task = task.clone();
                     async move |cx| {
                         task.await;
-
                         cx.on_next_frame(move |_, cx| {
                             cx.notify(entity_id);
                         });
@@ -2772,27 +4794,23 @@ impl Window {
         let (task, _) = cx.fetch_asset::<A>(source);
         task.now_or_never()
     }
-    /// Obtain the current element offset. This method should only be called during the
-    /// prepaint phase of element drawing.
+    /// Obtain the current element offset. This method should only be called during element drawing.
     pub fn element_offset(&self) -> Point<Pixels> {
-        self.invalidator.debug_assert_prepaint();
-        self.element_offset_stack
-            .last()
-            .copied()
-            .unwrap_or_default()
+        self.invalidator.debug_assert_prepaint_or_paint();
+        self.transform_stack.local_offset()
     }
 
     /// Obtain the current element opacity. This method should only be called during the
     /// prepaint phase of element drawing.
     #[inline]
     pub(crate) fn element_opacity(&self) -> f32 {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
         self.element_opacity
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
         self.content_mask_stack
             .last()
             .cloned()
@@ -2804,6 +4822,47 @@ impl Window {
             })
     }
 
+    /// Transform a content mask from local coordinates to world coordinates.
+    /// If we're inside a scroll transform context, the mask bounds need to be
+    /// transformed so they match the coordinate space used by the shader for
+    /// clipping comparisons.
+    #[inline]
+    pub(crate) fn transform_mask_to_world(&self, mask: ContentMask<Pixels>) -> ContentMask<Pixels> {
+        let transform_id = self.transform_stack.current();
+        if transform_id.is_root() {
+            return mask;
+        }
+
+        let scale_factor = self.scale_factor();
+        let world_transform = self
+            .segment_pool
+            .transforms
+            .get_world_no_cache(transform_id);
+
+        // Convert origin to ScaledPixels, apply transform, convert back to Pixels
+        let origin_scaled = Point::new(
+            ScaledPixels(mask.bounds.origin.x.0 * scale_factor),
+            ScaledPixels(mask.bounds.origin.y.0 * scale_factor),
+        );
+        let world_origin = world_transform.apply(origin_scaled);
+
+        // Scale the size by the transform's scale factor
+        let world_size = Size {
+            width: Pixels(mask.bounds.size.width.0 * world_transform.scale),
+            height: Pixels(mask.bounds.size.height.0 * world_transform.scale),
+        };
+
+        ContentMask {
+            bounds: Bounds {
+                origin: Point::new(
+                    Pixels(world_origin.x.0 / scale_factor),
+                    Pixels(world_origin.y.0 / scale_factor),
+                ),
+                size: world_size,
+            },
+        }
+    }
+
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
     /// This can be used within a custom element to distinguish multiple sets of child elements.
     pub fn with_element_namespace<R>(
@@ -2811,10 +4870,7 @@ impl Window {
         element_id: impl Into<ElementId>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id.into());
-        let result = f(self);
-        self.element_id_stack.pop();
-        result
+        self.with_global_id(element_id.into(), |_, window| f(window))
     }
 
     /// Use a piece of state that exists as long this element is being rendered in consecutive frames.
@@ -2864,10 +4920,10 @@ impl Window {
         )
     }
 
-    /// Updates or initializes state for an element with the given id that lives across multiple
-    /// frames. If an element with this ID existed in the rendered frame, its state will be passed
-    /// to the given closure. The state returned by the closure will be stored so it can be referenced
-    /// when drawing the next frame. This method should only be called as part of element drawing.
+    /// Updates or initializes state for the given element id, stored on the fiber as long as it
+    /// persists across frames. The state returned by the closure will be stored and reused the next
+    /// time this fiber is drawn. This method should only be called as part of element drawing.
+    ///
     pub fn with_element_state<S, R>(
         &mut self,
         global_id: &GlobalElementId,
@@ -2876,71 +4932,58 @@ impl Window {
     where
         S: 'static,
     {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator
+            .debug_assert_reconcile_or_layout_or_prepaint_or_paint();
+        self.with_element_state_inner(global_id, f)
+    }
 
-        let key = (global_id.clone(), TypeId::of::<S>());
-        self.next_frame.accessed_element_states.push(key.clone());
+    pub(crate) fn with_element_state_in_event<S, R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
+    ) -> R
+    where
+        S: 'static,
+    {
+        self.with_element_state_inner(global_id, f)
+    }
 
-        if let Some(any) = self
-            .next_frame
-            .element_states
-            .remove(&key)
-            .or_else(|| self.rendered_frame.element_states.remove(&key))
-        {
-            let ElementStateBox {
-                inner,
-                #[cfg(debug_assertions)]
-                type_name,
-            } = any;
-            // Using the extra inner option to avoid needing to reallocate a new box.
-            let mut state_box = inner
-                .downcast::<Option<S>>()
-                .map_err(|_| {
-                    #[cfg(debug_assertions)]
-                    {
-                        anyhow::anyhow!(
-                            "invalid element state type for id, requested {:?}, actual: {:?}",
-                            std::any::type_name::<S>(),
-                            type_name
-                        )
-                    }
-
-                    #[cfg(not(debug_assertions))]
-                    {
-                        anyhow::anyhow!(
-                            "invalid element state type for id, requested {:?}",
-                            std::any::type_name::<S>(),
-                        )
-                    }
-                })
-                .unwrap();
-
-            let state = state_box.take().expect(
-                "reentrant call to with_element_state for the same state type and element id",
-            );
-            let (result, state) = f(Some(state), self);
-            state_box.replace(state);
-            self.next_frame.element_states.insert(
-                key,
-                ElementStateBox {
-                    inner: state_box,
-                    #[cfg(debug_assertions)]
-                    type_name,
-                },
-            );
-            result
-        } else {
-            let (result, state) = f(None, self);
-            self.next_frame.element_states.insert(
-                key,
-                ElementStateBox {
-                    inner: Box::new(Some(state)),
-                    #[cfg(debug_assertions)]
-                    type_name: std::any::type_name::<S>(),
-                },
-            );
-            result
+    fn with_element_state_inner<S, R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
+    ) -> R
+    where
+        S: 'static,
+    {
+        let fiber_key: DefaultKey = (*global_id).into();
+        if !self.fiber.tree.fibers.contains_key(fiber_key) {
+            let (result, _discarded) = f(None, self);
+            return result;
         }
+
+        let store: Rc<StateStore> = {
+            let Some(entry) = self.fiber.tree.element_states.entry(fiber_key) else {
+                let (result, _discarded) = f(None, self);
+                return result;
+            };
+            entry.or_insert_with(|| Rc::new(StateStore::new())).clone()
+        };
+
+        store.with_mut::<S, R>(|state| f(state, self))
+    }
+
+    pub(crate) fn with_input_handler_mut<R>(
+        &mut self,
+        fiber_id: GlobalElementId,
+        cx: &mut App,
+        f: impl FnOnce(&mut dyn InputHandler, &mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        let slot_key: DefaultKey = fiber_id.into();
+        let mut handler = self.fiber.tree.input_handlers.remove(slot_key)?;
+        let result = f(handler.as_mut(), self, cx);
+        self.fiber.tree.input_handlers.insert(slot_key, handler);
+        Some(result)
     }
 
     /// A variant of `with_element_state` that allows the element's id to be optional. This is a convenience
@@ -2957,11 +5000,12 @@ impl Window {
     where
         S: 'static,
     {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator
+            .debug_assert_reconcile_or_layout_or_prepaint_or_paint();
 
         if let Some(global_id) = global_id {
-            self.with_element_state(global_id, |state, cx| {
-                let (result, state) = f(Some(state), cx);
+            self.with_element_state(global_id, |state, window| {
+                let (result, state) = f(Some(state), window);
                 let state =
                     state.expect("you must return some state when you pass some element id");
                 (result, state)
@@ -2979,14 +5023,222 @@ impl Window {
     /// Executes the given closure within the context of a tab group.
     #[inline]
     pub fn with_tab_group<R>(&mut self, index: Option<isize>, f: impl FnOnce(&mut Self) -> R) -> R {
-        if let Some(index) = index {
-            self.next_frame.tab_stops.begin_group(index);
-            let result = f(self);
-            self.next_frame.tab_stops.end_group();
-            result
-        } else {
-            f(self)
+        self.fibers().with_tab_group(index, f)
+    }
+
+    /// Begins a tab group scope. Must be paired with `end_tab_group`.
+    /// This is useful for retained node implementations where children are painted
+    /// between begin and end calls.
+    pub fn begin_tab_group(&mut self, index: isize) {
+        self.invalidator.debug_assert_paint();
+        self.fiber.rendered_tab_stops.begin_group(index);
+    }
+
+    /// Ends a tab group scope started by `begin_tab_group`.
+    pub fn end_tab_group(&mut self) {
+        self.invalidator.debug_assert_paint();
+        self.fiber.rendered_tab_stops.end_group();
+    }
+
+    /// Creates a fiber for a dynamically rendered element.
+    /// This is used by virtualized lists and other elements that create children dynamically.
+    /// Returns the global element ID that can be used with `with_element_context`.
+    pub fn create_element_fiber(&mut self, element: &AnyElement) -> GlobalElementId {
+        self.fiber.tree.create_fiber_for(element)
+    }
+
+    /// Checks if a fiber exists for the given element ID.
+    /// This is useful for virtualized lists to check if an item's fiber is still valid.
+    pub fn element_fiber_exists(&self, id: &GlobalElementId) -> bool {
+        self.fiber.tree.get(id).is_some()
+    }
+
+    /// Removes a fiber for a dynamically rendered element.
+    /// This should be called when a dynamic element is no longer needed.
+    pub fn remove_element_fiber(&mut self, id: &GlobalElementId) {
+        self.fiber.tree.remove(id);
+    }
+
+    /// Executes the given closure within the context of a specific element fiber.
+    /// This sets up the element ID stack so that child elements are properly associated
+    /// with the parent fiber.
+    pub fn with_element_context<R>(
+        &mut self,
+        fiber_id: GlobalElementId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.push_fiber_id(fiber_id);
+        let result = f(self);
+        self.pop_fiber_id();
+        result
+    }
+
+    /// Measures an element's size using the fiber-backed layout pipeline.
+    ///
+    /// This is the preferred way to measure elements for sizing probes (e.g., virtualized
+    /// lists measuring item heights). This goes through the retained fiber/node pipeline,
+    /// ensuring that RenderNode::measure is used for
+    /// leaf sizing and that layout context (text style, image cache) is properly inherited.
+    ///
+    /// The measurement is performed in a temporary fiber subtree that:
+    /// - Does NOT affect focus state (focusable_fibers is not modified)
+    /// - Does NOT register view roots
+    /// - Does NOT run prepaint or paint
+    /// - Is automatically cleaned up after measurement
+    ///
+    /// Returns the computed size of the element.
+    pub(crate) fn measure_element_via_fibers(
+        &mut self,
+        element: &mut AnyElement,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        // Create a temporary measurement root fiber.
+        //
+        // Use a placeholder fiber so we don't accidentally participate in keyed
+        // view-root bookkeeping (`tree.view_roots`) during cleanup.
+        let measure_root = self.fiber.tree.create_placeholder_fiber();
+
+        // Expand wrapper elements BEFORE reconciliation.
+        element.expand_wrappers(self, cx);
+        element.expand_views_detached(self, cx);
+
+        // Reconcile the element subtree into the measurement root
+        self.fiber
+            .tree
+            .reconcile_wrapper(&measure_root, element, false);
+
+        // Install render nodes using measurement-safe variant (no focus/view mutations)
+        self.fibers()
+            .cache_fiber_payloads_measurement(&measure_root, element, cx);
+
+        self.prepare_detached_root_for_layout(measure_root, cx);
+
+        // Scope layout engine state so we don't clobber the main frame's state
+        let saved_fibers_layout_changed =
+            std::mem::take(&mut self.layout_engine.fibers_layout_changed);
+        let saved_pending_measure_calls =
+            std::mem::take(&mut self.layout_engine.pending_measure_calls);
+
+        // Compute layout
+        self.compute_layout_for_fiber(measure_root, available_space, cx);
+
+        // Read the computed size
+        let layout_id = TaffyLayoutEngine::layout_id(&measure_root);
+        let bounds = self.with_layout_engine(|layout_engine, window| {
+            layout_engine.layout_bounds(window, layout_id)
+        });
+
+        // Restore layout engine state
+        self.layout_engine.fibers_layout_changed = saved_fibers_layout_changed;
+        self.layout_engine.pending_measure_calls = saved_pending_measure_calls;
+
+        // Clean up the temporary measurement subtree
+        self.fiber.tree.remove(&measure_root);
+
+        bounds.size
+    }
+
+    /// Draws an element using the fiber-backed rendering pipeline.
+    ///
+    /// This is similar to `measure_element_via_fibers` but also performs prepaint and paint.
+    /// It supports views by using the full reconciliation path with view expansion.
+    ///
+    /// Used by test utilities to render elements through the retained node pipeline.
+    ///
+    /// Returns the computed bounds of the rendered element.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn draw_element_via_fibers(
+        &mut self,
+        element: &mut AnyElement,
+        origin: Point<Pixels>,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Bounds<Pixels> {
+        // Phase 1: Reconcile
+        // Set the phase for reconciliation (required by debug assertions in cache_fiber_payloads and expand_view_fibers)
+        self.invalidator.set_phase(DrawPhase::Reconcile);
+
+        // Create a temporary root fiber for this draw call.
+        let draw_root = self.fiber.tree.create_placeholder_fiber();
+
+        // Reconcile the element subtree into the draw root
+        self.fiber
+            .tree
+            .reconcile_wrapper(&draw_root, element, false);
+
+        // Save the current structure epoch so transient draw fibers don't
+        // force incremental collections to rebuild for the main rendered tree.
+        let saved_structure_epoch = self.fiber.tree.structure_epoch;
+
+        // Install render nodes. This registers view roots so expand_view_fibers can find them.
+        self.fibers().cache_fiber_payloads(&draw_root, element, cx);
+        self.expand_view_fibers(draw_root, cx);
+
+        self.prepare_detached_root_for_layout(draw_root, cx);
+
+        // Phase 2: Layout
+        // Scope layout engine state so we don't clobber the main frame's state
+        let saved_fibers_layout_changed =
+            std::mem::take(&mut self.layout_engine.fibers_layout_changed);
+        let saved_pending_measure_calls =
+            std::mem::take(&mut self.layout_engine.pending_measure_calls);
+
+        // Setup taffy styles from fibers (calls RenderNode::layout_begin/end)
+        self.invalidator.set_phase(DrawPhase::Layout);
+
+        // Compute layout
+        self.compute_layout_for_fiber(draw_root, available_space, cx);
+
+        // Read the computed bounds
+        let layout_id = TaffyLayoutEngine::layout_id(&draw_root);
+        let bounds = self.with_layout_engine(|layout_engine, window| {
+            layout_engine.layout_bounds(window, layout_id)
+        });
+
+        // Prepaint at the specified origin
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        self.with_absolute_element_offset(origin, |window| {
+            context::PrepaintCx::new(window).prepaint_fiber_tree(draw_root, cx)
+        });
+
+        // Ensure preorder indices are set before paint
+        self.fiber.tree.ensure_preorder_indices();
+
+        // Paint
+        self.invalidator.set_phase(DrawPhase::Paint);
+        context::PaintCx::new(self).paint_fiber_tree(draw_root, cx);
+
+        // Snapshot hitboxes
+        self.snapshot_hitboxes_into_rendered_frame();
+
+        // Reset phase
+        self.invalidator.set_phase(DrawPhase::None);
+
+        // Restore layout engine state
+        self.layout_engine.fibers_layout_changed = saved_fibers_layout_changed;
+        self.layout_engine.pending_measure_calls = saved_pending_measure_calls;
+
+        // Clean up the temporary draw subtree
+        self.fiber.tree.remove(&draw_root);
+
+        // Restore structure epoch to avoid perturbing the main tree's incremental
+        // ordering/caching mechanisms.
+        self.fiber.tree.structure_epoch = saved_structure_epoch;
+
+        // Return bounds offset by origin
+        Bounds {
+            origin,
+            size: bounds.size,
         }
+    }
+
+    /// Registers a focus handle as a tab stop for the current frame.
+    ///
+    /// This method should only be called during the paint phase of element drawing.
+    pub fn register_tab_stop(&mut self, focus_handle: &FocusHandle, tab_index: isize) {
+        self.invalidator.debug_assert_paint();
+        self.with_fiber_cx(|fiber| fiber.register_tab_stop(focus_handle, tab_index));
     }
 
     /// Defers the drawing of the given element, scheduling it to be painted on top of the currently-drawn tree
@@ -2994,48 +5246,51 @@ impl Window {
     /// with higher values being drawn on top.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
+    #[track_caller]
     pub fn defer_draw(
         &mut self,
         element: AnyElement,
         absolute_offset: Point<Pixels>,
         priority: usize,
     ) {
-        self.invalidator.debug_assert_prepaint();
-        let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
-        self.next_frame.deferred_draws.push(DeferredDraw {
-            current_view: self.current_view(),
-            parent_node,
-            element_id_stack: self.element_id_stack.clone(),
-            text_style_stack: self.text_style_stack.clone(),
-            priority,
-            element: Some(element),
-            absolute_offset,
-            prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
-            paint_range: PaintIndex::default()..PaintIndex::default(),
-        });
+        self.invalidator.debug_assert_layout_or_prepaint();
+        let callsite = core::panic::Location::caller();
+        self.with_fiber_cx(|fiber| fiber.defer_draw(element, absolute_offset, priority, callsite));
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
     /// of geometry that are non-overlapping and have the same draw order. This is typically used
-    /// for performance reasons.
+    /// for performance reasons. Bounds are used only to skip creating empty layers.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
-        if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_layer(clipped_bounds.scale(scale_factor));
+        let content_mask = self.content_mask().scale(scale_factor);
+        let local_bounds = bounds.scale(scale_factor);
+        let world_transform = self
+            .segment_pool
+            .transforms
+            .get_world_no_cache(self.transform_stack.current());
+        let world_bounds = Bounds {
+            origin: world_transform.apply(local_bounds.origin),
+            size: Size {
+                width: ScaledPixels(local_bounds.size.width.0 * world_transform.scale),
+                height: ScaledPixels(local_bounds.size.height.0 * world_transform.scale),
+            },
+        };
+
+        let clipped_bounds = world_bounds.intersect(&content_mask.bounds);
+        let pushed = !clipped_bounds.is_empty();
+        if pushed {
+            self.next_frame.scene.push_layer(&mut self.segment_pool);
         }
 
         let result = f(self);
 
-        if !clipped_bounds.is_empty() {
-            self.next_frame.scene.pop_layer();
+        if pushed {
+            self.next_frame.scene.pop_layer(&mut self.segment_pool);
         }
 
         result
@@ -3050,21 +5305,51 @@ impl Window {
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
     ) {
+        self.paint_shadows_with_transform(
+            bounds,
+            corner_radii,
+            shadows,
+            TransformationMatrix::unit(),
+        );
+    }
+
+    /// Paint one or more drop shadows with an explicit visual transform.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shadows_with_transform(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        transform: TransformationMatrix,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
+        let cull = self.should_cull_scene_primitives();
         for shadow in shadows {
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
-            self.next_frame.scene.insert_primitive(Shadow {
-                order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: shadow_bounds.scale(scale_factor),
-                content_mask: content_mask.scale(scale_factor),
-                corner_radii: corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity),
-            });
+            self.next_frame.scene.insert_primitive(
+                &mut self.segment_pool,
+                (
+                    Shadow {
+                        order: 0,
+                        blur_radius: shadow.blur_radius.scale(scale_factor),
+                        transform_index,
+                        pad: 0,
+                        bounds: shadow_bounds.scale(scale_factor),
+                        content_mask: content_mask.scale(scale_factor),
+                        corner_radii: corner_radii.scale(scale_factor),
+                        color: shadow.color.opacity(opacity),
+                    },
+                    transform,
+                ),
+                cull,
+            );
         }
     }
 
@@ -3078,21 +5363,41 @@ impl Window {
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
+        self.paint_quad_with_transform(quad, TransformationMatrix::unit());
+    }
+
+    /// Paint one or more quads with an explicit visual transform.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_quad_with_transform(&mut self, quad: PaintQuad, transform: TransformationMatrix) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        self.next_frame.scene.insert_primitive(Quad {
-            order: 0,
-            bounds: quad.bounds.scale(scale_factor),
-            content_mask: content_mask.scale(scale_factor),
-            background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(scale_factor),
-            border_widths: quad.border_widths.scale(scale_factor),
-            border_style: quad.border_style,
-        });
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
+        let cull = self.should_cull_scene_primitives();
+
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            (
+                Quad {
+                    order: 0,
+                    transform_index,
+                    pad: 0,
+                    bounds: quad.bounds.scale(scale_factor),
+                    content_mask: content_mask.scale(scale_factor),
+                    background: quad.background.opacity(opacity),
+                    border_color: quad.border_color.opacity(opacity),
+                    corner_radii: quad.corner_radii.scale(scale_factor),
+                    border_widths: quad.border_widths.scale(scale_factor),
+                    border_style: quad.border_style,
+                },
+                transform,
+            ),
+            cull,
+        );
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -3101,15 +5406,19 @@ impl Window {
     pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
         self.invalidator.debug_assert_paint();
 
+        path.transform_index = self.transform_stack.current().as_u32();
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        let cull = self.should_cull_scene_primitives();
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            path.scale(scale_factor),
+            cull,
+        );
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -3120,6 +5429,19 @@ impl Window {
         origin: Point<Pixels>,
         width: Pixels,
         style: &UnderlineStyle,
+    ) {
+        self.paint_underline_with_transform(origin, width, style, TransformationMatrix::unit());
+    }
+
+    /// Paint an underline with an explicit visual transform.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_underline_with_transform(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        style: &UnderlineStyle,
+        transform: TransformationMatrix,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -3135,16 +5457,26 @@ impl Window {
         };
         let content_mask = self.content_mask();
         let element_opacity = self.element_opacity();
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
+        let cull = self.should_cull_scene_primitives();
 
-        self.next_frame.scene.insert_primitive(Underline {
-            order: 0,
-            pad: 0,
-            bounds: bounds.scale(scale_factor),
-            content_mask: content_mask.scale(scale_factor),
-            color: style.color.unwrap_or_default().opacity(element_opacity),
-            thickness: style.thickness.scale(scale_factor),
-            wavy: if style.wavy { 1 } else { 0 },
-        });
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            (
+                Underline {
+                    order: 0,
+                    transform_index,
+                    bounds: bounds.scale(scale_factor),
+                    content_mask: content_mask.scale(scale_factor),
+                    color: style.color.unwrap_or_default().opacity(element_opacity),
+                    thickness: style.thickness.scale(scale_factor),
+                    wavy: if style.wavy { 1 } else { 0 },
+                },
+                transform,
+            ),
+            cull,
+        );
     }
 
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
@@ -3156,6 +5488,19 @@ impl Window {
         width: Pixels,
         style: &StrikethroughStyle,
     ) {
+        self.paint_strikethrough_with_transform(origin, width, style, TransformationMatrix::unit());
+    }
+
+    /// Paint a strikethrough with an explicit visual transform.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_strikethrough_with_transform(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        style: &StrikethroughStyle,
+        transform: TransformationMatrix,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -3166,16 +5511,26 @@ impl Window {
         };
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
+        let cull = self.should_cull_scene_primitives();
 
-        self.next_frame.scene.insert_primitive(Underline {
-            order: 0,
-            pad: 0,
-            bounds: bounds.scale(scale_factor),
-            content_mask: content_mask.scale(scale_factor),
-            thickness: style.thickness.scale(scale_factor),
-            color: style.color.unwrap_or_default().opacity(opacity),
-            wavy: 0,
-        });
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            (
+                Underline {
+                    order: 0,
+                    transform_index,
+                    bounds: bounds.scale(scale_factor),
+                    content_mask: content_mask.scale(scale_factor),
+                    thickness: style.thickness.scale(scale_factor),
+                    color: style.color.unwrap_or_default().opacity(opacity),
+                    wavy: 0,
+                },
+                transform,
+            ),
+            cull,
+        );
     }
 
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
@@ -3194,11 +5549,33 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
+        self.paint_glyph_with_transform(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            color,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paints a monochrome glyph with an explicit visual transform.
+    pub fn paint_glyph_with_transform(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        transform: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
 
         let subpixel_variant = Point {
             x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
@@ -3229,27 +5606,36 @@ impl Window {
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.content_mask().scale(scale_factor);
+            let cull = self.should_cull_scene_primitives();
 
             if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
+                self.next_frame.scene.insert_primitive(
+                    &mut self.segment_pool,
+                    SubpixelSprite {
+                        order: 0,
+                        transform_index,
+                        bounds,
+                        content_mask,
+                        color: color.opacity(element_opacity),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    },
+                    cull,
+                );
             } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
+                self.next_frame.scene.insert_primitive(
+                    &mut self.segment_pool,
+                    MonochromeSprite {
+                        order: 0,
+                        transform_index,
+                        bounds,
+                        content_mask,
+                        color: color.opacity(element_opacity),
+                        tile,
+                        transformation: transform,
+                    },
+                    cull,
+                );
             }
         }
         Ok(())
@@ -3289,10 +5675,30 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<()> {
+        self.paint_emoji_with_transform(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paints an emoji glyph with an explicit visual transform.
+    pub fn paint_emoji_with_transform(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        transform: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -3320,17 +5726,25 @@ impl Window {
             };
             let content_mask = self.content_mask().scale(scale_factor);
             let opacity = self.element_opacity();
+            let cull = self.should_cull_scene_primitives();
 
-            self.next_frame.scene.insert_primitive(PolychromeSprite {
-                order: 0,
-                pad: 0,
-                grayscale: false,
-                bounds,
-                corner_radii: Default::default(),
-                content_mask,
-                tile,
-                opacity,
-            });
+            self.next_frame.scene.insert_primitive(
+                &mut self.segment_pool,
+                (
+                    PolychromeSprite {
+                        order: 0,
+                        transform_index,
+                        grayscale: false,
+                        bounds,
+                        corner_radii: Default::default(),
+                        content_mask,
+                        tile,
+                        opacity,
+                    },
+                    transform,
+                ),
+                cull,
+            );
         }
         Ok(())
     }
@@ -3351,6 +5765,7 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
+        let transform_index = self.transform_stack.current().as_u32();
 
         let bounds = bounds.scale(scale_factor);
         let params = RenderSvgParams {
@@ -3384,18 +5799,23 @@ impl Window {
                 .size
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
+        let cull = self.should_cull_scene_primitives();
 
-        self.next_frame.scene.insert_primitive(MonochromeSprite {
-            order: 0,
-            pad: 0,
-            bounds: svg_bounds
-                .map_origin(|origin| origin.round())
-                .map_size(|size| size.ceil()),
-            content_mask,
-            color: color.opacity(element_opacity),
-            tile,
-            transformation,
-        });
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            MonochromeSprite {
+                order: 0,
+                transform_index,
+                bounds: svg_bounds
+                    .map_origin(|origin| origin.round())
+                    .map_size(|size| size.ceil()),
+                content_mask,
+                color: color.opacity(element_opacity),
+                tile,
+                transformation,
+            },
+            cull,
+        );
 
         Ok(())
     }
@@ -3411,6 +5831,26 @@ impl Window {
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
+    ) -> Result<()> {
+        self.paint_image_with_transform(
+            bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paint an image with an explicit visual transform.
+    pub fn paint_image_with_transform(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transform: TransformationMatrix,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -3436,20 +5876,41 @@ impl Window {
         let content_mask = self.content_mask().scale(scale_factor);
         let corner_radii = corner_radii.scale(scale_factor);
         let opacity = self.element_opacity();
+        let transform_index = self.transform_stack.current().as_u32();
+        let transform = self.scale_transform_for_scene(transform);
+        let cull = self.should_cull_scene_primitives();
 
-        self.next_frame.scene.insert_primitive(PolychromeSprite {
-            order: 0,
-            pad: 0,
-            grayscale,
-            bounds: bounds
-                .map_origin(|origin| origin.floor())
-                .map_size(|size| size.ceil()),
-            content_mask,
-            corner_radii,
-            tile,
-            opacity,
-        });
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            (
+                PolychromeSprite {
+                    order: 0,
+                    transform_index,
+                    grayscale,
+                    bounds: bounds
+                        .map_origin(|origin| origin.floor())
+                        .map_size(|size| size.ceil()),
+                    content_mask,
+                    corner_radii,
+                    tile,
+                    opacity,
+                },
+                transform,
+            ),
+            cull,
+        );
         Ok(())
+    }
+
+    fn scale_transform_for_scene(&self, transform: TransformationMatrix) -> TransformationMatrix {
+        if transform.is_unit() {
+            return transform;
+        }
+        let scale_factor = self.scale_factor();
+        let mut scaled = transform;
+        scaled.translation[0] *= scale_factor;
+        scaled.translation[1] *= scale_factor;
+        scaled
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.
@@ -3464,12 +5925,19 @@ impl Window {
         let scale_factor = self.scale_factor();
         let bounds = bounds.scale(scale_factor);
         let content_mask = self.content_mask().scale(scale_factor);
-        self.next_frame.scene.insert_primitive(PaintSurface {
-            order: 0,
-            bounds,
-            content_mask,
-            image_buffer,
-        });
+        let transform_index = self.transform_stack.current().as_u32();
+        let cull = self.should_cull_scene_primitives();
+        self.next_frame.scene.insert_primitive(
+            &mut self.segment_pool,
+            PaintSurface {
+                order: 0,
+                transform_index,
+                bounds,
+                content_mask,
+                image_buffer,
+            },
+            cull,
+        );
     }
 
     /// Removes an image from the sprite atlas.
@@ -3486,11 +5954,197 @@ impl Window {
         Ok(())
     }
 
-    /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
-    /// layout is being requested, along with the layout ids of any children. This method is called during
-    /// calls to the [`Element::request_layout`] trait method and enables any element to participate in layout.
+    pub(crate) fn push_fiber_id(&mut self, id: GlobalElementId) {
+        self.fibers().push_fiber_id(id);
+    }
+
+    pub(crate) fn pop_fiber_id(&mut self) {
+        self.fibers().pop_fiber_id();
+    }
+
+    pub(crate) fn current_fiber_id(&self) -> Option<GlobalElementId> {
+        self.fibers_ref().current_fiber_id()
+    }
+
+    pub(crate) fn with_element_id_stack<R>(
+        &mut self,
+        fiber_id: &GlobalElementId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if self.current_fiber_id() == Some(*fiber_id) {
+            return f(self);
+        }
+        self.push_fiber_id(*fiber_id);
+        let result = f(self);
+        self.pop_fiber_id();
+        result
+    }
+
+    /// Ensure a fiber exists for the current fiber scope, creating one if necessary.
+    pub(crate) fn ensure_fiber_for_current_id(&mut self) -> GlobalElementId {
+        self.fibers().ensure_fiber_for_current_id()
+    }
+
+    /// Ensure a pending fiber exists for a view root outside of render traversal.
+    pub(crate) fn ensure_view_root_fiber(&mut self, view_id: EntityId) -> GlobalElementId {
+        self.fibers().ensure_view_root_fiber(view_id)
+    }
+
+    pub(crate) fn record_pending_view_accesses(
+        &mut self,
+        fiber_id: &GlobalElementId,
+        accessed: FxHashSet<EntityId>,
+    ) {
+        if accessed.is_empty() {
+            return;
+        }
+        self.pending_view_accesses
+            .entry(*fiber_id)
+            .or_insert_with(FxHashSet::default)
+            .extend(accessed);
+    }
+
+    pub(crate) fn take_pending_view_accesses(
+        &mut self,
+        fiber_id: &GlobalElementId,
+    ) -> Option<FxHashSet<EntityId>> {
+        self.pending_view_accesses.remove(&fiber_id)
+    }
+
+    pub(crate) fn hydrate_view_children(&self, element: &mut AnyElement) {
+        // Recursively hydrate children
+        for child in element.children_mut() {
+            self.hydrate_view_children(child);
+        }
+    }
+
+    fn map_view_roots_from_element(
+        &mut self,
+        fiber_id: &GlobalElementId,
+        element: &AnyElement,
+        new_view_fibers: &mut Vec<GlobalElementId>,
+    ) {
+        self.fibers()
+            .map_view_roots_from_element(fiber_id, element, new_view_fibers);
+    }
+
+    pub(crate) fn should_render_view_fiber(&self, fiber_id: &GlobalElementId) -> bool {
+        self.fibers_ref().should_render_view_fiber(fiber_id)
+    }
+
+    fn expand_view_fibers(&mut self, root_fiber: GlobalElementId, cx: &mut App) {
+        self.fibers().expand_view_fibers(root_fiber, cx);
+    }
+
+    pub(crate) fn fiber_view_id(
+        &self,
+        fiber_id: &GlobalElementId,
+        fiber: &crate::Fiber,
+    ) -> Option<EntityId> {
+        fiber.view_id.or_else(|| {
+            self.fiber
+                .tree
+                .view_state
+                .get((*fiber_id).into())
+                .and_then(|state| state.view_data.as_ref())
+                .map(|view| view.view.entity_id())
+        })
+    }
+
+    pub(crate) fn paint_svg_paths(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        svg_path: Option<&SharedString>,
+        svg_external_path: Option<&SharedString>,
+        svg_transformation: Option<crate::Transformation>,
+        color: Hsla,
+        cx: &mut App,
+    ) {
+        if bounds.size.is_zero() {
+            return;
+        }
+
+        let transformation = svg_transformation
+            .map(|transformation| transformation.into_matrix(bounds.center(), self.scale_factor()))
+            .unwrap_or_default();
+
+        if let Some(path) = svg_path {
+            self.paint_svg(bounds, path.clone(), None, transformation, color, cx)
+                .log_err();
+            return;
+        }
+
+        let Some(path) = svg_external_path else {
+            return;
+        };
+        let Some(bytes) = self
+            .use_asset::<crate::elements::SvgAsset>(path, cx)
+            .and_then(|asset| asset.log_err())
+        else {
+            return;
+        };
+
+        self.paint_svg(
+            bounds,
+            path.clone(),
+            Some(&bytes),
+            transformation,
+            color,
+            cx,
+        )
+        .log_err();
+    }
+
+    fn cache_fiber_payloads(
+        &mut self,
+        fiber_id: &GlobalElementId,
+        element: &mut AnyElement,
+        cx: &mut App,
+    ) {
+        self.fibers().cache_fiber_payloads(fiber_id, element, cx);
+    }
+
+    pub(crate) fn remove_rendered_tab_stops_for_fiber(
+        &mut self,
+        owner_id: GlobalElementId,
+        focus_ids: impl IntoIterator<Item = FocusId>,
+    ) {
+        for focus_id in focus_ids {
+            self.fiber
+                .rendered_tab_stops
+                .remove_if_owned_by(&focus_id, owner_id);
+        }
+    }
+
+    pub(crate) fn layout_bounds_cached(
+        &self,
+        global_id: &GlobalElementId,
+        scale_factor: f32,
+        cache: &mut FxHashMap<GlobalElementId, Bounds<Pixels>>,
+    ) -> Bounds<Pixels> {
+        crate::taffy::layout_bounds(self, global_id, scale_factor, cache)
+    }
+
+    /// Temporarily take the layout engine out of self, use it via the closure, and restore it.
+    /// This pattern is needed because layout engine methods require both `&mut self` on the engine
+    /// and `&mut Window`.
+    fn with_layout_engine<R>(
+        &mut self,
+        f: impl FnOnce(&mut TaffyLayoutEngine, &mut Self) -> R,
+    ) -> R {
+        let mut layout_engine =
+            std::mem::replace(&mut self.layout_engine, TaffyLayoutEngine::new());
+        let result = f(&mut layout_engine, self);
+        self.layout_engine = layout_engine;
+        result
+    }
+
+    /// Add a node to the layout tree for the current frame, using the current fiber scope.
+    /// This method is called during [`Element::request_layout`] and enables any element
+    /// to participate in layout. Children are implicit in the fiber tree.
     ///
-    /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    /// This method should only be called as part of the request_layout or prepaint phase
+    /// of element drawing.
     #[must_use]
     pub fn request_layout(
         &mut self,
@@ -3498,19 +6152,12 @@ impl Window {
         children: impl IntoIterator<Item = LayoutId>,
         cx: &mut App,
     ) -> LayoutId {
-        self.invalidator.debug_assert_prepaint();
-
-        cx.layout_id_buffer.clear();
-        cx.layout_id_buffer.extend(children);
-        let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
-
-        self.layout_engine.as_mut().unwrap().request_layout(
-            style,
-            rem_size,
-            scale_factor,
-            &cx.layout_id_buffer,
-        )
+        let fiber_id = self.ensure_fiber_for_current_id();
+        self.invalidator.debug_assert_layout_or_prepaint();
+        let children: Vec<_> = children.into_iter().collect();
+        self.with_layout_engine(|layout_engine, window| {
+            layout_engine.request_layout(window, fiber_id, style, children, cx)
+        })
     }
 
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,
@@ -3521,19 +6168,43 @@ impl Window {
     /// returns a `Size`.
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    /// For better performance with caching, use `request_measured_layout_cached` instead.
     pub fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
     where
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
-        self.invalidator.debug_assert_prepaint();
+        let fiber_id = self.ensure_fiber_for_current_id();
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_layout_engine(|layout_engine, window| {
+            layout_engine.request_measured_layout(window, fiber_id, style, measure)
+        })
+    }
 
-        let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
-        self.layout_engine
-            .as_mut()
-            .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+    /// Request a measured layout with caching support.
+    ///
+    /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    pub fn request_measured_layout_cached<F>(
+        &mut self,
+        style: Style,
+        content_hash: u64,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        let fiber_id = self.ensure_fiber_for_current_id();
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_layout_engine(|layout_engine, window| {
+            layout_engine.request_measured_layout_cached(
+                window,
+                fiber_id,
+                style,
+                content_hash,
+                measure,
+            )
+        })
     }
 
     /// Compute the layout for the given id within the given available space.
@@ -3546,12 +6217,23 @@ impl Window {
         layout_id: LayoutId,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
-    ) {
-        self.invalidator.debug_assert_prepaint();
+    ) -> usize {
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_layout_engine(|layout_engine, window| {
+            layout_engine.compute_layout(window, layout_id, available_space, cx)
+        })
+    }
 
-        let mut layout_engine = self.layout_engine.take().unwrap();
-        layout_engine.compute_layout(layout_id, available_space, self, cx);
-        self.layout_engine = Some(layout_engine);
+    pub(crate) fn compute_layout_for_fiber(
+        &mut self,
+        fiber_id: GlobalElementId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> usize {
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_layout_engine(|layout_engine, window| {
+            layout_engine.compute_layout_for_fiber(window, fiber_id, available_space, cx)
+        })
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
@@ -3559,16 +6241,11 @@ impl Window {
     ///
     /// This method should only be called as part of element drawing.
     pub fn layout_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
-        self.invalidator.debug_assert_prepaint();
-
-        let scale_factor = self.scale_factor();
-        let mut bounds = self
-            .layout_engine
-            .as_mut()
-            .unwrap()
-            .layout_bounds(layout_id, scale_factor)
-            .map(Into::into);
-        bounds.origin += self.element_offset();
+        self.invalidator.debug_assert_layout_or_prepaint();
+        let mut bounds = self.with_layout_engine(|layout_engine, window| {
+            layout_engine.layout_bounds(window, layout_id)
+        });
+        bounds.origin += self.transform_stack.local_offset();
         bounds
     }
 
@@ -3578,19 +6255,8 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
-        self.invalidator.debug_assert_prepaint();
-
-        let content_mask = self.content_mask();
-        let mut id = self.next_hitbox_id;
-        self.next_hitbox_id = self.next_hitbox_id.next();
-        let hitbox = Hitbox {
-            id,
-            bounds,
-            content_mask,
-            behavior,
-        };
-        self.next_frame.hitboxes.push(hitbox.clone());
-        hitbox
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_fiber_cx(|fiber| fiber.insert_hitbox(bounds, behavior))
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -3607,19 +6273,35 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn set_key_context(&mut self, context: KeyContext) {
         self.invalidator.debug_assert_paint();
-        self.next_frame.dispatch_tree.set_key_context(context);
+        self.with_fiber_cx(|fiber| fiber.set_key_context(context));
     }
 
     /// Sets the focus handle for the current element. This handle will be used to manage focus state
     /// and keyboard event dispatch for the element.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
-    pub fn set_focus_handle(&mut self, focus_handle: &FocusHandle, _: &App) {
-        self.invalidator.debug_assert_prepaint();
-        if focus_handle.is_focused(self) {
-            self.next_frame.focus = Some(focus_handle.id);
-        }
-        self.next_frame.dispatch_tree.set_focus_id(focus_handle.id);
+    pub fn set_focus_handle(&mut self, focus_handle: &FocusHandle, cx: &App) {
+        self.invalidator.debug_assert_layout_or_prepaint();
+        let _ = cx;
+        self.with_fiber_cx(|fiber| fiber.set_focus_handle(focus_handle));
+    }
+
+    /// Sets the focus handle for a specific element identified by its global element id.
+    /// This is used when the element's focus handle needs to be registered with a specific fiber.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn set_focus_handle_for(&mut self, global_id: GlobalElementId, focus_handle: &FocusHandle) {
+        self.invalidator.debug_assert_layout_or_prepaint();
+        self.with_fiber_cx_for(global_id, |fiber| fiber.set_focus_handle(focus_handle));
+    }
+
+    /// Registers a focus handle as a tab stop for the current element.
+    /// The focus handle should already have its tab stop configuration set.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn register_tab_stop_handle(&mut self, focus_handle: &FocusHandle) {
+        self.invalidator.debug_assert_paint();
+        self.with_fiber_cx(|fiber| fiber.register_tab_stop_handle(focus_handle));
     }
 
     /// Sets the view id for the current element, which will be used to manage view caching.
@@ -3628,21 +6310,39 @@ impl Window {
     /// method eventually when we solve some issues that require us to construct editor elements
     /// directly instead of always using editors via views.
     pub fn set_view_id(&mut self, view_id: EntityId) {
-        self.invalidator.debug_assert_prepaint();
-        self.next_frame.dispatch_tree.set_view_id(view_id);
+        self.invalidator.debug_assert_layout_or_prepaint();
+        let _ = view_id;
     }
 
     /// Get the entity ID for the currently rendering view
     pub fn current_view(&self) -> EntityId {
-        self.invalidator.debug_assert_paint_or_prepaint();
-        self.rendered_entity_stack.last().copied().unwrap()
+        debug_assert!(
+            matches!(
+                self.invalidator.phase(),
+                DrawPhase::Reconcile | DrawPhase::Layout | DrawPhase::Prepaint | DrawPhase::Paint
+            ),
+            "Window::current_view can only be called during reconciliation, layout, prepaint, or paint"
+        );
+        if let Some(id) = self.rendered_entity_stack.last().copied() {
+            return id;
+        }
+
+        // Render layers and other out-of-tree rendering can legitimately run
+        // outside a view's `Element` implementation. When that happens, fall
+        // back to the window root view so subsystems like image caching can
+        // still associate work with a view.
+        self.root
+            .as_ref()
+            .map(|root| root.entity_id())
+            .expect("Window::current_view called with no rendered view and no root view")
     }
 
-    pub(crate) fn with_rendered_view<R>(
-        &mut self,
-        id: EntityId,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    /// Execute `f` while treating `id` as the "current view".
+    ///
+    /// This is primarily intended for render layers and other out-of-tree
+    /// rendering that needs a stable view identity for subsystems like image
+    /// caching and view-local state.
+    pub fn with_rendered_view<R>(&mut self, id: EntityId, f: impl FnOnce(&mut Self) -> R) -> R {
         self.rendered_entity_stack.push(id);
         let result = f(self);
         self.rendered_entity_stack.pop();
@@ -3679,13 +6379,7 @@ impl Window {
         cx: &App,
     ) {
         self.invalidator.debug_assert_paint();
-
-        if focus_handle.is_focused(self) {
-            let cx = self.to_async(cx);
-            self.next_frame
-                .input_handlers
-                .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
-        }
+        self.with_fiber_cx(|fiber| fiber.handle_input(focus_handle, input_handler, cx));
     }
 
     /// Register a mouse event listener on the window for the next frame. The type of event
@@ -3693,19 +6387,33 @@ impl Window {
     /// the listener will be cleared.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
+    ///
+    /// # Deprecation
+    ///
+    /// For fiber-native elements implementing `RenderNode`, prefer using the typed listener
+    /// methods on `PaintCtx` instead:
+    /// - `ctx.on_mouse_down(|event, phase, hitbox, window, cx| ...)`
+    /// - `ctx.on_mouse_up(|event, phase, hitbox, window, cx| ...)`
+    /// - `ctx.on_mouse_move(|event, phase, hitbox, window, cx| ...)`
+    /// - `ctx.on_scroll_wheel(|event, phase, hitbox, window, cx| ...)`
+    /// - `ctx.on_click(|event, window, cx| ...)`
+    ///
+    /// These methods are more efficient as they avoid runtime type downcasting.
+    ///
+    /// Continue using `on_mouse_event` for:
+    /// - Legacy elements that don't use `RenderNode`
+    /// - Elements with multiple hitboxes requiring manual hit testing
+    /// - Elements that need to listen for events outside their hitbox
+    #[deprecated(
+        since = "0.1.0",
+        note = "For fiber-native elements, use PaintCtx::on_mouse_down/up/move or on_scroll_wheel instead. See method documentation for when to continue using this."
+    )]
     pub fn on_mouse_event<Event: MouseEvent>(
         &mut self,
         mut listener: impl FnMut(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
-        self.invalidator.debug_assert_paint();
-
-        self.next_frame.mouse_listeners.push(Some(Box::new(
-            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    listener(event, phase, window, cx)
-                }
-            },
-        )));
+        self.invalidator.debug_assert_prepaint_or_paint();
+        self.with_fiber_cx(|fiber| fiber.on_mouse_event(listener));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -3721,14 +6429,7 @@ impl Window {
         listener: impl Fn(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
-
-        self.next_frame.dispatch_tree.on_key_event(Rc::new(
-            move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref::<Event>() {
-                    listener(event, phase, window, cx)
-                }
-            },
-        ));
+        self.with_fiber_cx(|fiber| fiber.on_key_event(listener))
     }
 
     /// Register a modifiers changed event listener on the window for the next frame.
@@ -3742,12 +6443,7 @@ impl Window {
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
-
-        self.next_frame.dispatch_tree.on_modifiers_changed(Rc::new(
-            move |event: &ModifiersChangedEvent, window: &mut Window, cx: &mut App| {
-                listener(event, window, cx)
-            },
-        ));
+        self.with_fiber_cx(|fiber| fiber.on_modifiers_changed(listener))
     }
 
     /// Register a listener to be called when the given focus handle or one of its descendants receives focus.
@@ -3799,12 +6495,12 @@ impl Window {
         subscription
     }
 
-    fn reset_cursor_style(&self, cx: &mut App) {
+    pub(crate) fn reset_cursor_style(&mut self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
             let style = self
-                .rendered_frame
-                .cursor_style(self)
+                .fibers()
+                .cursor_style_for_frame()
                 .unwrap_or(CursorStyle::Arrow);
             cx.platform.set_cursor_style(style);
         }
@@ -3814,11 +6510,12 @@ impl Window {
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
         let keystroke = keystroke.with_simulated_ime();
+        let prefer_character_input = keystroke.key_char.is_some();
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
                 is_held: false,
-                prefer_character_input: false,
+                prefer_character_input,
             }),
             cx,
         );
@@ -3829,7 +6526,7 @@ impl Window {
         if let Some(input) = keystroke.key_char
             && let Some(mut input_handler) = self.platform_window.take_input_handler()
         {
-            input_handler.dispatch_input(&input, self, cx);
+            input_handler.dispatch_input(&input);
             self.platform_window.set_input_handler(input_handler);
             return true;
         }
@@ -3891,6 +6588,7 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
@@ -3966,65 +6664,25 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
-        if hit_test != self.mouse_hit_test {
-            self.mouse_hit_test = hit_test;
-            self.reset_cursor_style(cx);
-        }
-
-        #[cfg(any(feature = "inspector", debug_assertions))]
-        if self.is_inspector_picking(cx) {
-            self.handle_inspector_mouse_event(event, cx);
-            // When inspector is picking, all other mouse handling is skipped.
-            return;
-        }
-
-        let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
-
-        // Capture phase, events bubble from back to front. Handlers for this phase are used for
-        // special purposes, such as detecting events outside of a given Bounds.
-        for listener in &mut mouse_listeners {
-            let listener = listener.as_mut().unwrap();
-            listener(event, DispatchPhase::Capture, self, cx);
-            if !cx.propagate_event {
-                break;
-            }
-        }
-
-        // Bubble phase, where most normal handlers do their work.
-        if cx.propagate_event {
-            for listener in mouse_listeners.iter_mut().rev() {
-                let listener = listener.as_mut().unwrap();
-                listener(event, DispatchPhase::Bubble, self, cx);
-                if !cx.propagate_event {
-                    break;
-                }
-            }
-        }
-
-        self.rendered_frame.mouse_listeners = mouse_listeners;
-
-        if cx.has_active_drag() {
-            if event.is::<MouseMoveEvent>() {
-                // If this was a mouse move event, redraw the window so that the
-                // active drag can follow the mouse cursor.
-                self.refresh();
-            } else if event.is::<MouseUpEvent>() {
-                // If this was a mouse up event, cancel the active drag and redraw
-                // the window.
-                cx.active_drag = None;
-                self.refresh();
-            }
-        }
+        let _event_phase = context::EventPhaseScope::new(self.invalidator.clone());
+        context::EventCx::new(self).dispatch_mouse_event(event, cx);
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
+        let event_phase = context::EventPhaseScope::new(self.invalidator.clone());
         if self.invalidator.is_dirty() {
-            self.draw(cx).clear();
+            self.draw(cx);
+            event_phase.reassert();
         }
 
-        let node_id = self.focus_node_id_in_rendered_frame(self.focus);
-        let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
+        let mut node_id = self.focus_node_id_in_rendered_frame(self.focus);
+        let mut context_stack = self.fibers_ref().context_stack_for_node(node_id);
+        if context_stack.is_empty() && self.invalidator.not_drawing() {
+            self.draw(cx);
+            node_id = self.focus_node_id_in_rendered_frame(self.focus);
+            context_stack = self.fibers_ref().context_stack_for_node(node_id);
+            event_phase.reassert();
+        }
 
         let mut keystroke: Option<Keystroke> = None;
 
@@ -4062,14 +6720,14 @@ impl Window {
         }
 
         let Some(keystroke) = keystroke else {
-            self.finish_dispatch_key_event(event, dispatch_path, self.context_stack(), cx);
+            self.finish_dispatch_key_event(event, node_id, context_stack, cx);
             return;
         };
 
         cx.propagate_event = true;
-        self.dispatch_keystroke_interceptors(event, self.context_stack(), cx);
+        self.dispatch_keystroke_interceptors(event, context_stack.clone(), cx);
         if !cx.propagate_event {
-            self.finish_dispatch_key_event(event, dispatch_path, self.context_stack(), cx);
+            self.finish_dispatch_key_event(event, node_id, context_stack, cx);
             return;
         }
 
@@ -4077,12 +6735,12 @@ impl Window {
         if currently_pending.focus.is_some() && currently_pending.focus != self.focus {
             currently_pending = PendingInput::default();
         }
+        let had_pending = !currently_pending.keystrokes.is_empty();
 
-        let match_result = self.rendered_frame.dispatch_tree.dispatch_key(
-            currently_pending.keystrokes,
-            keystroke,
-            &dispatch_path,
-        );
+        let pending_keystrokes = currently_pending.keystrokes.clone();
+        let match_result =
+            self.key_dispatch
+                .dispatch_key(pending_keystrokes, keystroke, &context_stack);
 
         if !match_result.to_replay.is_empty() {
             self.replay_pending_input(match_result.to_replay, cx);
@@ -4099,7 +6757,7 @@ impl Window {
                 .filter(|key_down| key_down.keystroke.key_char.is_some())
                 .and_then(|_| self.platform_window.take_input_handler())
                 .map_or(false, |mut input_handler| {
-                    let accepts = input_handler.accepts_text_input(self, cx);
+                    let accepts = input_handler.accepts_text_input();
                     self.platform_window.set_input_handler(input_handler);
                     accepts
                 });
@@ -4120,13 +6778,11 @@ impl Window {
                         };
 
                         let node_id = window.focus_node_id_in_rendered_frame(window.focus);
-                        let dispatch_path =
-                            window.rendered_frame.dispatch_tree.dispatch_path(node_id);
+                        let context_stack = window.fibers_ref().context_stack_for_node(node_id);
 
                         let to_replay = window
-                            .rendered_frame
-                            .dispatch_tree
-                            .flush_dispatch(currently_pending.keystrokes, &dispatch_path);
+                            .key_dispatch
+                            .flush_dispatch(currently_pending.keystrokes, &context_stack);
 
                         window.pending_input_changed(cx);
                         window.replay_pending_input(to_replay, cx)
@@ -4142,6 +6798,13 @@ impl Window {
             return;
         }
 
+        let prefer_character_input =
+            event
+                .downcast_ref::<KeyDownEvent>()
+                .is_some_and(|key_down_event| {
+                    key_down_event.prefer_character_input
+                        && key_down_event.keystroke.key_char.is_some()
+                });
         let skip_bindings = event
             .downcast_ref::<KeyDownEvent>()
             .filter(|key_down_event| key_down_event.prefer_character_input)
@@ -4149,7 +6812,7 @@ impl Window {
                 self.platform_window
                     .take_input_handler()
                     .map_or(false, |mut input_handler| {
-                        let accepts = input_handler.accepts_text_input(self, cx);
+                        let accepts = input_handler.accepts_text_input();
                         self.platform_window.set_input_handler(input_handler);
                         // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
                         // we prefer the text input over bindings.
@@ -4157,6 +6820,13 @@ impl Window {
                     })
             })
             .unwrap_or(false);
+
+        if (skip_bindings || prefer_character_input) && had_pending {
+            self.pending_input = Some(currently_pending);
+            self.pending_input_changed(cx);
+            cx.propagate_event = false;
+            return;
+        }
 
         if !skip_bindings {
             for binding in match_result.bindings {
@@ -4174,23 +6844,23 @@ impl Window {
             }
         }
 
-        self.finish_dispatch_key_event(event, dispatch_path, match_result.context_stack, cx);
+        self.finish_dispatch_key_event(event, node_id, match_result.context_stack, cx);
         self.pending_input_changed(cx);
     }
 
     fn finish_dispatch_key_event(
         &mut self,
         event: &dyn Any,
-        dispatch_path: SmallVec<[DispatchNodeId; 32]>,
+        node_id: GlobalElementId,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
     ) {
-        self.dispatch_key_down_up_event(event, &dispatch_path, cx);
+        self.dispatch_key_down_up_event(event, node_id, cx);
         if !cx.propagate_event {
             return;
         }
 
-        self.dispatch_modifiers_changed_event(event, &dispatch_path, cx);
+        self.dispatch_modifiers_changed_event(event, node_id, cx);
         if !cx.propagate_event {
             return;
         }
@@ -4207,52 +6877,23 @@ impl Window {
     fn dispatch_key_down_up_event(
         &mut self,
         event: &dyn Any,
-        dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+        node_id: GlobalElementId,
         cx: &mut App,
     ) {
-        // Capture phase
-        for node_id in dispatch_path {
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
-
-            for key_listener in node.key_listeners.clone() {
-                key_listener(event, DispatchPhase::Capture, self, cx);
-                if !cx.propagate_event {
-                    return;
-                }
-            }
-        }
-
-        // Bubble phase
-        for node_id in dispatch_path.iter().rev() {
-            // Handle low level key events
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
-            for key_listener in node.key_listeners.clone() {
-                key_listener(event, DispatchPhase::Bubble, self, cx);
-                if !cx.propagate_event {
-                    return;
-                }
-            }
-        }
+        self.fibers().dispatch_key_listeners(event, node_id, cx);
     }
 
     fn dispatch_modifiers_changed_event(
         &mut self,
         event: &dyn Any,
-        dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+        node_id: GlobalElementId,
         cx: &mut App,
     ) {
         let Some(event) = event.downcast_ref::<ModifiersChangedEvent>() else {
             return;
         };
-        for node_id in dispatch_path.iter().rev() {
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
-            for listener in node.modifiers_changed_listeners.clone() {
-                listener(event, self, cx);
-                if !cx.propagate_event {
-                    return;
-                }
-            }
-        }
+        self.fibers()
+            .dispatch_modifiers_listeners(event, node_id, cx);
     }
 
     /// Determine whether a potential multi-stroke key binding is in progress on this window.
@@ -4273,8 +6914,6 @@ impl Window {
 
     fn replay_pending_input(&mut self, replays: SmallVec<[Replay; 1]>, cx: &mut App) {
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
-        let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
-
         'replay: for replay in replays {
             let event = KeyDownEvent {
                 keystroke: replay.keystroke.clone(),
@@ -4296,37 +6935,29 @@ impl Window {
                 }
             }
 
-            self.dispatch_key_down_up_event(&event, &dispatch_path, cx);
+            self.dispatch_key_down_up_event(&event, node_id, cx);
             if !cx.propagate_event {
                 continue 'replay;
             }
             if let Some(input) = replay.keystroke.key_char.as_ref().cloned()
                 && let Some(mut input_handler) = self.platform_window.take_input_handler()
             {
-                input_handler.dispatch_input(&input, self, cx);
+                input_handler.dispatch_input(&input);
                 self.platform_window.set_input_handler(input_handler)
             }
         }
     }
 
-    fn focus_node_id_in_rendered_frame(&self, focus_id: Option<FocusId>) -> DispatchNodeId {
-        focus_id
-            .and_then(|focus_id| {
-                self.rendered_frame
-                    .dispatch_tree
-                    .focusable_node_id(focus_id)
-            })
-            .unwrap_or_else(|| self.rendered_frame.dispatch_tree.root_node_id())
+    fn focus_node_id_in_rendered_frame(&self, focus_id: Option<FocusId>) -> GlobalElementId {
+        self.fibers_ref().focus_node_id_in_rendered_frame(focus_id)
     }
 
     fn dispatch_action_on_node(
         &mut self,
-        node_id: DispatchNodeId,
+        node_id: GlobalElementId,
         action: &dyn Action,
         cx: &mut App,
     ) {
-        let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
-
         // Capture phase for global actions.
         cx.propagate_event = true;
         if let Some(mut global_listeners) = cx
@@ -4354,43 +6985,11 @@ impl Window {
             return;
         }
 
-        // Capture phase for window actions.
-        for node_id in &dispatch_path {
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
-            for DispatchActionListener {
-                action_type,
-                listener,
-            } in node.action_listeners.clone()
-            {
-                let any_action = action.as_any();
-                if action_type == any_action.type_id() {
-                    listener(any_action, DispatchPhase::Capture, self, cx);
-
-                    if !cx.propagate_event {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Bubble phase for window actions.
-        for node_id in dispatch_path.iter().rev() {
-            let node = self.rendered_frame.dispatch_tree.node(*node_id);
-            for DispatchActionListener {
-                action_type,
-                listener,
-            } in node.action_listeners.clone()
-            {
-                let any_action = action.as_any();
-                if action_type == any_action.type_id() {
-                    cx.propagate_event = false; // Actions stop propagation by default during the bubble phase
-                    listener(any_action, DispatchPhase::Bubble, self, cx);
-
-                    if !cx.propagate_event {
-                        return;
-                    }
-                }
-            }
+        if !self
+            .fibers()
+            .dispatch_window_action_listeners(action, node_id, cx)
+        {
+            return;
         }
 
         // Bubble phase for global actions.
@@ -4455,9 +7054,9 @@ impl Window {
 
     /// Updates the IME panel position suggestions for languages like japanese, chinese.
     pub fn invalidate_character_coordinates(&self) {
-        self.on_next_frame(|window, cx| {
+        self.on_next_frame(|window, _cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
-                if let Some(bounds) = input_handler.selected_bounds(window, cx) {
+                if let Some(bounds) = input_handler.selected_bounds() {
                     window.platform_window.update_ime_position(bounds);
                 }
                 window.platform_window.set_input_handler(input_handler);
@@ -4525,18 +7124,31 @@ impl Window {
     /// Returns the current context stack.
     pub fn context_stack(&self) -> Vec<KeyContext> {
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
-        let dispatch_tree = &self.rendered_frame.dispatch_tree;
-        dispatch_tree
-            .dispatch_path(node_id)
-            .iter()
-            .filter_map(move |&node_id| dispatch_tree.node(node_id).context.clone())
-            .collect()
+        self.fibers_ref().context_stack_for_node(node_id)
     }
 
     /// Returns all available actions for the focused element.
     pub fn available_actions(&self, cx: &App) -> Vec<Box<dyn Action>> {
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
-        let mut actions = self.rendered_frame.dispatch_tree.available_actions(node_id);
+        let mut actions = Vec::<Box<dyn Action>>::new();
+        let mut current = Some(node_id);
+        while let Some(fiber_id) = current {
+            if let Some(effects) = self.get_fiber_effects(&fiber_id) {
+                for (action_type, _) in &effects.action_listeners {
+                    if let Err(ix) =
+                        actions.binary_search_by_key(action_type, |a| a.as_any().type_id())
+                    {
+                        // Intentionally silence these errors without logging.
+                        // If an action cannot be built by default, it's not available.
+                        let action = cx.actions.build_action_type(action_type).ok();
+                        if let Some(action) = action {
+                            actions.insert(ix, action);
+                        }
+                    }
+                }
+            }
+            current = self.fibers_ref().parent_for(&fiber_id);
+        }
         for action_type in cx.global_action_listeners.keys() {
             if let Err(ix) = actions.binary_search_by_key(action_type, |a| a.as_any().type_id()) {
                 let action = cx.actions.build_action_type(action_type).ok();
@@ -4551,20 +7163,15 @@ impl Window {
     /// Returns key bindings that invoke an action on the currently focused element. Bindings are
     /// returned in the order they were added. For display, the last binding should take precedence.
     pub fn bindings_for_action(&self, action: &dyn Action) -> Vec<KeyBinding> {
-        self.rendered_frame
-            .dispatch_tree
-            .bindings_for_action(action, &self.rendered_frame.dispatch_tree.context_stack)
+        self.key_dispatch
+            .bindings_for_action(action, &self.context_stack())
     }
 
     /// Returns the highest precedence key binding that invokes an action on the currently focused
     /// element. This is more efficient than getting the last result of `bindings_for_action`.
     pub fn highest_precedence_binding_for_action(&self, action: &dyn Action) -> Option<KeyBinding> {
-        self.rendered_frame
-            .dispatch_tree
-            .highest_precedence_binding_for_action(
-                action,
-                &self.rendered_frame.dispatch_tree.context_stack,
-            )
+        self.key_dispatch
+            .highest_precedence_binding_for_action(action, &self.context_stack())
     }
 
     /// Returns the key bindings for an action in a context.
@@ -4573,8 +7180,7 @@ impl Window {
         action: &dyn Action,
         context: KeyContext,
     ) -> Vec<KeyBinding> {
-        let dispatch_tree = &self.rendered_frame.dispatch_tree;
-        dispatch_tree.bindings_for_action(action, &[context])
+        self.key_dispatch.bindings_for_action(action, &[context])
     }
 
     /// Returns the highest precedence key binding for an action in a context. This is more
@@ -4584,8 +7190,8 @@ impl Window {
         action: &dyn Action,
         context: KeyContext,
     ) -> Option<KeyBinding> {
-        let dispatch_tree = &self.rendered_frame.dispatch_tree;
-        dispatch_tree.highest_precedence_binding_for_action(action, &[context])
+        self.key_dispatch
+            .highest_precedence_binding_for_action(action, &[context])
     }
 
     /// Returns any bindings that would invoke an action on the given focus handle if it were
@@ -4596,11 +7202,11 @@ impl Window {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> Vec<KeyBinding> {
-        let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let Some(context_stack) = self.context_stack_for_focus_handle(focus_handle) else {
             return vec![];
         };
-        dispatch_tree.bindings_for_action(action, &context_stack)
+        self.key_dispatch
+            .bindings_for_action(action, &context_stack)
     }
 
     /// Returns the highest precedence key binding that would invoke an action on the given focus
@@ -4611,15 +7217,14 @@ impl Window {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> Option<KeyBinding> {
-        let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let context_stack = self.context_stack_for_focus_handle(focus_handle)?;
-        dispatch_tree.highest_precedence_binding_for_action(action, &context_stack)
+        self.key_dispatch
+            .highest_precedence_binding_for_action(action, &context_stack)
     }
 
     /// Find the bindings that can follow the current input sequence for the current context stack.
     pub fn possible_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
-        self.rendered_frame
-            .dispatch_tree
+        self.key_dispatch
             .possible_next_bindings_for_input(input, &self.context_stack())
     }
 
@@ -4627,14 +7232,8 @@ impl Window {
         &self,
         focus_handle: &FocusHandle,
     ) -> Option<Vec<KeyContext>> {
-        let dispatch_tree = &self.rendered_frame.dispatch_tree;
-        let node_id = dispatch_tree.focusable_node_id(focus_handle.id)?;
-        let context_stack: Vec<_> = dispatch_tree
-            .dispatch_path(node_id)
-            .into_iter()
-            .filter_map(|node_id| dispatch_tree.node(node_id).context.clone())
-            .collect();
-        Some(context_stack)
+        self.fibers_ref()
+            .context_stack_for_focus_handle(focus_handle)
     }
 
     /// Returns a generic event listener that invokes the given listener with the view and context associated with the given view handle.
@@ -4688,10 +7287,7 @@ impl Window {
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
-
-        self.next_frame
-            .dispatch_tree
-            .on_action(action_type, Rc::new(listener));
+        self.with_fiber_cx(|fiber| fiber.on_action(action_type, listener));
     }
 
     /// Register a capturing action listener on this node for the next frame if the condition is true.
@@ -4711,9 +7307,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         if condition {
-            self.next_frame
-                .dispatch_tree
-                .on_action(action_type, Rc::new(listener));
+            self.on_action(action_type, listener);
         }
     }
 
@@ -4820,7 +7414,7 @@ impl Window {
         &mut self,
         path: crate::InspectorElementPath,
     ) -> crate::InspectorElementId {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_layout_or_prepaint();
         let path = Rc::new(path);
         let next_instance_id = self
             .next_frame
@@ -4832,30 +7426,6 @@ impl Window {
         crate::InspectorElementId { path, instance_id }
     }
 
-    #[cfg(any(feature = "inspector", debug_assertions))]
-    fn prepaint_inspector(&mut self, inspector_width: Pixels, cx: &mut App) -> Option<AnyElement> {
-        if let Some(inspector) = self.inspector.take() {
-            let mut inspector_element = AnyView::from(inspector.clone()).into_any_element();
-            inspector_element.prepaint_as_root(
-                point(self.viewport_size.width - inspector_width, px(0.0)),
-                size(inspector_width, self.viewport_size.height).into(),
-                self,
-                cx,
-            );
-            self.inspector = Some(inspector);
-            Some(inspector_element)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(any(feature = "inspector", debug_assertions))]
-    fn paint_inspector(&mut self, mut inspector_element: Option<AnyElement>, cx: &mut App) {
-        if let Some(mut inspector_element) = inspector_element {
-            inspector_element.paint(self, cx);
-        };
-    }
-
     /// Registers a hitbox that can be used for inspector picking mode, allowing users to select and
     /// inspect UI elements by clicking on them.
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4865,7 +7435,7 @@ impl Window {
         inspector_id: Option<&crate::InspectorElementId>,
         cx: &App,
     ) {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_prepaint_or_paint();
         if !self.is_inspector_picking(cx) {
             return;
         }
@@ -4881,11 +7451,7 @@ impl Window {
         if let Some(inspector) = self.inspector.as_ref() {
             let inspector = inspector.read(cx);
             if let Some((hitbox_id, _)) = self.hovered_inspector_hitbox(inspector, &self.next_frame)
-                && let Some(hitbox) = self
-                    .next_frame
-                    .hitboxes
-                    .iter()
-                    .find(|hitbox| hitbox.id == hitbox_id)
+                && let Some(hitbox) = self.resolve_hitbox(&hitbox_id)
             {
                 self.paint_quad(crate::fill(hitbox.bounds, crate::rgba(0x61afef4d)));
             }
@@ -4893,7 +7459,7 @@ impl Window {
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]
-    fn handle_inspector_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+    pub(crate) fn handle_inspector_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
         let Some(inspector) = self.inspector.clone() else {
             return;
         };
@@ -5471,3 +8037,6 @@ pub fn outline(
         border_style,
     }
 }
+
+#[cfg(test)]
+mod tests;

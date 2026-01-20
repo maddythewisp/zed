@@ -3,16 +3,16 @@ use std::{ops::Range, rc::Rc};
 use gpui::{
     AbsoluteLength, AppContext, Context, DefiniteLength, DragMoveEvent, Entity, EntityId,
     FocusHandle, Length, ListHorizontalSizingBehavior, ListSizingBehavior, ListState, Point,
-    Stateful, UniformListScrollHandle, WeakEntity, list, transparent_black, uniform_list,
+    UniformListScrollHandle, WeakEntity, list, transparent_black, uniform_list,
 };
 
 use crate::{
     ActiveTheme as _, AnyElement, App, Button, ButtonCommon as _, ButtonStyle, Color, Component,
     ComponentScope, Div, ElementId, FixedWidth as _, FluentBuilder as _, Indicator,
     InteractiveElement, IntoElement, ParentElement, Pixels, RegisterComponent, RenderOnce,
-    ScrollAxes, ScrollableHandle, Scrollbars, SharedString, StatefulInteractiveElement, Styled,
-    StyledExt as _, StyledTypography, Window, WithScrollbar, div, example_group_with_title, h_flex,
-    px, single_example,
+    ScrollAxes, ScrollableHandle, Scrollbars, SharedString, Styled, StyledExt as _,
+    StyledTypography, Window, WithScrollbar, div, example_group_with_title, h_flex, px,
+    single_example,
     table_row::{IntoTableRow as _, TableRow},
     v_flex,
 };
@@ -728,7 +728,7 @@ pub struct Table {
     rows: TableContents,
     interaction_state: Option<WeakEntity<TableInteractionState>>,
     col_widths: Option<TableWidths>,
-    map_row: Option<Rc<dyn Fn((usize, Stateful<Div>), &mut Window, &mut App) -> AnyElement>>,
+    map_row: Option<Rc<dyn Fn((usize, Div), &mut Window, &mut App) -> AnyElement>>,
     use_ui_font: bool,
     empty_table_callback: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     /// The number of columns in the table. Used to assert column numbers in `TableRow` collections
@@ -881,7 +881,7 @@ impl Table {
 
     pub fn map_row(
         mut self,
-        callback: impl Fn((usize, Stateful<Div>), &mut Window, &mut App) -> AnyElement + 'static,
+        callback: impl Fn((usize, Div), &mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
         self.map_row = Some(Rc::new(callback));
         self
@@ -1048,7 +1048,7 @@ pub struct TableRenderContext {
     pub striped: bool,
     pub total_row_count: usize,
     pub column_widths: Option<TableRow<Length>>,
-    pub map_row: Option<Rc<dyn Fn((usize, Stateful<Div>), &mut Window, &mut App) -> AnyElement>>,
+    pub map_row: Option<Rc<dyn Fn((usize, Div), &mut Window, &mut App) -> AnyElement>>,
     pub use_ui_font: bool,
 }
 

@@ -40,7 +40,7 @@ use crate::{
         linux::wayland::{display::WaylandDisplay, serial::SerialKind},
     },
 };
-use crate::{WindowKind, scene::Scene};
+use crate::{SceneSegmentPool, WindowKind, scene::Scene};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -1301,9 +1301,9 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene, segment_pool: &SceneSegmentPool) {
         let mut state = self.borrow_mut();
-        state.renderer.draw(scene);
+        state.renderer.draw(scene, segment_pool);
     }
 
     fn completed_frame(&self) {

@@ -1,14 +1,24 @@
+use gpui_macros::Element;
 use std::{
+    any::TypeId,
     rc::Rc,
     time::{Duration, Instant},
 };
 
+use refineable::Refineable;
+use smallvec::SmallVec;
+use taffy::style::{Dimension, Style as TaffyStyle};
+
 use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, Window,
+    AnyElement, App, DefiniteLength, ElementId, ElementImpl, GlobalElementId,
+    IntoElement, Length, Pixels, Style, Window,
+    render_node::{
+        CallbackSlot, ConditionalSlot, LayoutCtx, LayoutFrame, PaintCtx, PaintFrame, PrepaintCtx,
+        PrepaintFrame, RenderNode, UpdateResult,
+    },
 };
 
 pub use easing::*;
-use smallvec::SmallVec;
 
 /// An animation that can be applied to an element.
 #[derive(Clone)]
@@ -58,7 +68,7 @@ pub trait AnimationExt {
         animator: impl Fn(Self, f32) -> Self + 'static,
     ) -> AnimationElement<Self>
     where
-        Self: Sized,
+        Self: Sized + IntoElement + 'static,
     {
         AnimationElement {
             id: id.into(),
@@ -76,7 +86,7 @@ pub trait AnimationExt {
         animator: impl Fn(Self, usize, f32) -> Self + 'static,
     ) -> AnimationElement<Self>
     where
-        Self: Sized,
+        Self: Sized + IntoElement + 'static,
     {
         AnimationElement {
             id: id.into(),
@@ -90,14 +100,16 @@ pub trait AnimationExt {
 impl<E: IntoElement + 'static> AnimationExt for E {}
 
 /// A GPUI element that applies an animation to another element
-pub struct AnimationElement<E> {
+#[derive(Element)]
+#[element(crate = crate)]
+pub struct AnimationElement<E: IntoElement + 'static> {
     id: ElementId,
     element: Option<E>,
     animations: SmallVec<[Animation; 1]>,
     animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
 }
 
-impl<E> AnimationElement<E> {
+impl<E: IntoElement + 'static> AnimationElement<E> {
     /// Returns a new [`AnimationElement<E>`] after applying the given function
     /// to the element being animated.
     pub fn map_element(mut self, f: impl FnOnce(E) -> E) -> AnimationElement<E> {
@@ -114,95 +126,229 @@ impl<E: IntoElement + 'static> IntoElement for AnimationElement<E> {
     }
 }
 
-struct AnimationState {
+/// Type alias for the callback that produces the animated child.
+type ProduceChildFn = dyn FnOnce(usize, f32) -> AnyElement;
+
+/// Retained render node for AnimationElement.
+///
+/// Stores animation timing state and uses fiber-backed rendering for the
+/// animated child. The child is produced during layout and reconciled into
+/// the main fiber tree via a node-owned conditional slot, so it participates
+/// in the normal layout/prepaint/paint passes.
+pub(crate) struct AnimationNode {
     start: Instant,
     animation_ix: usize,
+    animations: SmallVec<[Animation; 1]>,
+    produce_child: CallbackSlot<ProduceChildFn>,
+    pending_child: Option<AnyElement>,
+    cached_taffy_style: TaffyStyle,
+    done: bool,
 }
 
-impl<E: IntoElement + 'static> Element for AnimationElement<E> {
-    type RequestLayoutState = AnyElement;
-    type PrepaintState = ();
+impl AnimationNode {
+    fn new(animations: SmallVec<[Animation; 1]>) -> Self {
+        Self {
+            start: Instant::now(),
+            animation_ix: 0,
+            animations,
+            produce_child: CallbackSlot::new(),
+            pending_child: None,
+            cached_taffy_style: TaffyStyle {
+                size: taffy::prelude::Size {
+                    width: Dimension::auto(),
+                    height: Dimension::auto(),
+                },
+                ..Default::default()
+            },
+            done: false,
+        }
+    }
 
+    fn compute_delta_and_advance(&mut self) -> (usize, f32) {
+        let animation_ix = self.animation_ix;
+        let mut delta = self.start.elapsed().as_secs_f32()
+            / self.animations[animation_ix].duration.as_secs_f32();
+
+        if delta > 1.0 {
+            if self.animations[animation_ix].oneshot {
+                if animation_ix >= self.animations.len() - 1 {
+                    self.done = true;
+                } else {
+                    self.start = Instant::now();
+                    self.animation_ix += 1;
+                }
+                delta = 1.0;
+            } else {
+                delta %= 1.0;
+            }
+        }
+
+        let eased_delta = (self.animations[animation_ix].easing)(delta);
+        debug_assert!(
+            (0.0..=1.0).contains(&eased_delta),
+            "delta should always be between 0 and 1"
+        );
+
+        (animation_ix, eased_delta)
+    }
+}
+
+impl RenderNode for AnimationNode {
+    fn taffy_style(&self, _rem_size: Pixels, _scale_factor: f32) -> TaffyStyle {
+        self.cached_taffy_style.clone()
+    }
+
+    fn compute_intrinsic_size(
+        &mut self,
+        _ctx: &mut crate::SizingCtx,
+    ) -> crate::IntrinsicSizeResult {
+        crate::IntrinsicSizeResult {
+            size: crate::IntrinsicSize::default(),
+            input: crate::SizingInput::default(),
+        }
+    }
+
+    fn uses_intrinsic_sizing_cache(&self) -> bool {
+        false
+    }
+
+    fn layout_begin(&mut self, ctx: &mut LayoutCtx) -> LayoutFrame {
+        let (animation_ix, delta) = self.compute_delta_and_advance();
+
+        // Store the produced child for slot reconciliation.
+        self.pending_child = None;
+        if let Some(produce) = self.produce_child.take() {
+            let child = produce(animation_ix, delta);
+
+            // The AnimationElement itself should be layout-transparent: it shouldn't break
+            // percentage sizing on the animated child (e.g. `size_full()`), which expects
+            // to resolve against the original parent constraints.
+            //
+            // When the animated child uses fractional sizing in an axis, make the wrapper
+            // fill that axis so the child's percentage behaves as if it were directly under
+            // the wrapper's parent.
+            let mut style = Style::default();
+            if let Some(refinement) = child.style() {
+                style.refine(refinement);
+            }
+
+            let child_uses_fraction_width = matches!(
+                style.size.width,
+                Length::Definite(DefiniteLength::Fraction(_))
+            );
+            let child_uses_fraction_height = matches!(
+                style.size.height,
+                Length::Definite(DefiniteLength::Fraction(_))
+            );
+
+            self.cached_taffy_style.size.width = if child_uses_fraction_width {
+                Dimension::percent(1.0)
+            } else {
+                Dimension::auto()
+            };
+            self.cached_taffy_style.size.height = if child_uses_fraction_height {
+                Dimension::percent(1.0)
+            } else {
+                Dimension::auto()
+            };
+
+            self.pending_child = Some(child);
+        }
+
+        if !self.done {
+            ctx.window.request_animation_frame();
+        }
+
+        LayoutFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn layout_end(&mut self, _ctx: &mut LayoutCtx, _frame: LayoutFrame) {}
+
+    fn conditional_slots(&mut self, _fiber_id: GlobalElementId) -> SmallVec<[ConditionalSlot; 4]> {
+        let mut slots = SmallVec::new();
+
+        let child = self.pending_child.take();
+        if let Some(child) = child {
+            slots.push(ConditionalSlot::active(0, move || child));
+        } else {
+            // Keep the existing child if we didn't produce a new one this layout pass.
+            slots.push(ConditionalSlot {
+                slot_index: 0,
+                active: true,
+                element_factory: None,
+            });
+        }
+
+        slots
+    }
+
+    fn prepaint_begin(&mut self, ctx: &mut PrepaintCtx) -> PrepaintFrame {
+        let _ = ctx;
+        PrepaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_end(&mut self, _ctx: &mut PrepaintCtx, _frame: PrepaintFrame) {}
+
+    fn paint_begin(&mut self, ctx: &mut PaintCtx) -> PaintFrame {
+        let _ = ctx;
+        PaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn paint_end(&mut self, _ctx: &mut PaintCtx, _frame: PaintFrame) {}
+}
+
+impl<E: IntoElement + 'static> ElementImpl for AnimationElement<E> {
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        let mut node = AnimationNode::new(std::mem::take(&mut self.animations));
+
+        // Deposit the callback immediately (same logic as update_render_node)
+        if let Some(element) = self.element.take() {
+            let animator = std::mem::replace(&mut self.animator, Box::new(|e, _, _| e));
+            node.produce_child
+                .deposit(Box::new(move |animation_ix, delta| {
+                    (animator)(element, animation_ix, delta).into_any_element()
+                }));
+        }
+
+        Some(Box::new(node))
     }
 
-    fn request_layout(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (crate::LayoutId, Self::RequestLayoutState) {
-        window.with_element_state(global_id.unwrap(), |state, window| {
-            let mut state = state.unwrap_or_else(|| AnimationState {
-                start: Instant::now(),
-                animation_ix: 0,
-            });
-            let animation_ix = state.animation_ix;
-
-            let mut delta = state.start.elapsed().as_secs_f32()
-                / self.animations[animation_ix].duration.as_secs_f32();
-
-            let mut done = false;
-            if delta > 1.0 {
-                if self.animations[animation_ix].oneshot {
-                    if animation_ix >= self.animations.len() - 1 {
-                        done = true;
-                    } else {
-                        state.start = Instant::now();
-                        state.animation_ix += 1;
-                    }
-                    delta = 1.0;
-                } else {
-                    delta %= 1.0;
-                }
-            }
-            let delta = (self.animations[animation_ix].easing)(delta);
-
-            debug_assert!(
-                (0.0..=1.0).contains(&delta),
-                "delta should always be between 0 and 1"
-            );
-
-            let element = self.element.take().expect("should only be called once");
-            let mut element = (self.animator)(element, animation_ix, delta).into_any_element();
-
-            if !done {
-                window.request_animation_frame();
-            }
-
-            ((element.request_layout(window, cx), element), state)
-        })
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<AnimationNode>())
     }
 
-    fn prepaint(
+    fn update_render_node(
         &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: crate::Bounds<crate::Pixels>,
-        element: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        element.prepaint(window, cx);
-    }
+        node: &mut dyn RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        let node = node.as_any_mut().downcast_mut::<AnimationNode>()?;
 
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: crate::Bounds<crate::Pixels>,
-        element: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        element.paint(window, cx);
+        node.animations = std::mem::take(&mut self.animations);
+
+        let element = self.element.take()?;
+        let animator = std::mem::replace(&mut self.animator, Box::new(|e, _, _| e));
+
+        node.produce_child
+            .deposit(Box::new(move |animation_ix, delta| {
+                (animator)(element, animation_ix, delta).into_any_element()
+            }));
+
+        Some(UpdateResult::LAYOUT_CHANGED)
     }
 }
 

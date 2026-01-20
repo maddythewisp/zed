@@ -1,9 +1,9 @@
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
-    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
-    Element, Empty, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
+    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem,
+    Empty, EventEmitter, ForegroundExecutor, Global, InputEvent, IntoElement, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
     WindowHandle, WindowOptions, app::GpuiMode,
 };
@@ -805,29 +805,25 @@ impl VisualTestContext {
         self.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
     }
 
-    /// Draw an element to the window. Useful for simulating events or actions
+    /// Draw an element to the window using the fiber-backed rendering pipeline.
+    ///
+    /// This is the preferred method for drawing elements in tests. It uses the retained
+    /// node path which supports all element types including those that have migrated
+    /// to `RenderNode` (List, UniformList, Div, etc.).
+    ///
+    /// Returns the computed bounds of the rendered element.
     pub fn draw<E>(
         &mut self,
         origin: Point<Pixels>,
         space: impl Into<Size<AvailableSpace>>,
         f: impl FnOnce(&mut Window, &mut App) -> E,
-    ) -> (E::RequestLayoutState, E::PrepaintState)
+    ) -> Bounds<Pixels>
     where
-        E: Element,
+        E: IntoElement,
     {
         self.update(|window, cx| {
-            window.invalidator.set_phase(DrawPhase::Prepaint);
-            let mut element = Drawable::new(f(window, cx));
-            element.layout_as_root(space.into(), window, cx);
-            window.with_absolute_element_offset(origin, |window| element.prepaint(window, cx));
-
-            window.invalidator.set_phase(DrawPhase::Paint);
-            let (request_layout_state, prepaint_state) = element.paint(window, cx);
-
-            window.invalidator.set_phase(DrawPhase::None);
-            window.refresh();
-
-            (request_layout_state, prepaint_state)
+            let mut element = f(window, cx).into_any_element();
+            window.draw_element_via_fibers(&mut element, origin, space.into(), cx)
         })
     }
 

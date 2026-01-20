@@ -24,7 +24,7 @@ use futures::FutureExt;
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, ClipboardEntry, ClipboardItem, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, FontWeight, Global, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, RenderImage, SharedString, Size, StatefulInteractiveElement,
+    ParentElement, Pixels, Render, RenderImage, SharedString, Size,
     Styled, Subscription, Task, WeakEntity, actions, div, img, point, prelude::*,
     pulsating_between, size,
 };

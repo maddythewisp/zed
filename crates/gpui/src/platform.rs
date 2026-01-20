@@ -41,10 +41,11 @@ pub(crate) mod scap_screen_capture;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TaskTiming,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    ForegroundExecutor, GlobalElementId, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout,
+    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Scene, SceneSegmentPool, ShapedGlyph, ShapedRun, SharedString, Size,
+    SvgRenderer, SystemWindowTab, Task, TaskTiming, ThreadTaskTimings, Window, WindowControlArea,
+    hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -522,7 +523,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
-    fn draw(&self, scene: &Scene);
+    fn draw(&self, scene: &Scene, segment_pool: &SceneSegmentPool);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -585,7 +586,11 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
     #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
+    fn render_to_image(
+        &self,
+        _scene: &Scene,
+        _segment_pool: &SceneSegmentPool,
+    ) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
 }
@@ -697,7 +702,17 @@ impl PlatformTextSystem for NoopTextSystem {
     }
 
     fn glyph_raster_bounds(&self, _params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        Ok(Default::default())
+        // Return a deterministic non-zero raster bounds so tests can observe glyph primitives
+        // being inserted into the scene when using the test platform.
+        //
+        // The test platform uses `NoopTextSystem`, which doesn't rasterize real glyphs. However,
+        // the retained fiber rendering architecture relies on glyph primitives being stored in
+        // scene segments, so it's useful for tests to exercise that code path.
+        let side = DevicePixels(10);
+        Ok(Bounds {
+            origin: Point::default(),
+            size: size(side, side),
+        })
     }
 
     fn rasterize_glyph(
@@ -943,7 +958,7 @@ impl From<TileId> for etagere::AllocId {
 
 pub(crate) struct PlatformInputHandler {
     cx: AsyncWindowContext,
-    handler: Box<dyn InputHandler>,
+    fiber_id: GlobalElementId,
 }
 
 #[cfg_attr(
@@ -954,15 +969,18 @@ pub(crate) struct PlatformInputHandler {
     allow(dead_code)
 )]
 impl PlatformInputHandler {
-    pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
-        Self { cx, handler }
+    pub fn new(cx: AsyncWindowContext, fiber_id: GlobalElementId) -> Self {
+        Self { cx, fiber_id }
     }
 
     fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
         self.cx
             .update(|window, cx| {
-                self.handler
-                    .selected_text_range(ignore_disabled_input, window, cx)
+                window
+                    .with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                        handler.selected_text_range(ignore_disabled_input, window, cx)
+                    })
+                    .flatten()
             })
             .ok()
             .flatten()
@@ -971,7 +989,13 @@ impl PlatformInputHandler {
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn marked_text_range(&mut self) -> Option<Range<usize>> {
         self.cx
-            .update(|window, cx| self.handler.marked_text_range(window, cx))
+            .update(|window, cx| {
+                window
+                    .with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                        handler.marked_text_range(window, cx)
+                    })
+                    .flatten()
+            })
             .ok()
             .flatten()
     }
@@ -987,8 +1011,11 @@ impl PlatformInputHandler {
     ) -> Option<String> {
         self.cx
             .update(|window, cx| {
-                self.handler
-                    .text_for_range(range_utf16, adjusted, window, cx)
+                window
+                    .with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                        handler.text_for_range(range_utf16, adjusted, window, cx)
+                    })
+                    .flatten()
             })
             .ok()
             .flatten()
@@ -997,8 +1024,9 @@ impl PlatformInputHandler {
     fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
-                self.handler
-                    .replace_text_in_range(replacement_range, text, window, cx);
+                window.with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                    handler.replace_text_in_range(replacement_range, text, window, cx);
+                });
             })
             .ok();
     }
@@ -1011,13 +1039,15 @@ impl PlatformInputHandler {
     ) {
         self.cx
             .update(|window, cx| {
-                self.handler.replace_and_mark_text_in_range(
-                    range_utf16,
-                    new_text,
-                    new_selected_range,
-                    window,
-                    cx,
-                )
+                window.with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                    handler.replace_and_mark_text_in_range(
+                        range_utf16,
+                        new_text,
+                        new_selected_range,
+                        window,
+                        cx,
+                    );
+                });
             })
             .ok();
     }
@@ -1025,50 +1055,94 @@ impl PlatformInputHandler {
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn unmark_text(&mut self) {
         self.cx
-            .update(|window, cx| self.handler.unmark_text(window, cx))
+            .update(|window, cx| {
+                window.with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                    handler.unmark_text(window, cx);
+                });
+            })
             .ok();
     }
 
     fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                window
+                    .with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                        handler.bounds_for_range(range_utf16, window, cx)
+                    })
+                    .flatten()
+            })
             .ok()
             .flatten()
     }
 
     #[allow(dead_code)]
     fn apple_press_and_hold_enabled(&mut self) -> bool {
-        self.handler.apple_press_and_hold_enabled()
+        self.cx
+            .update(|window, cx| {
+                window.with_input_handler_mut(self.fiber_id, cx, |handler, _, _| {
+                    handler.apple_press_and_hold_enabled()
+                })
+            })
+            .ok()
+            .flatten()
+            .unwrap_or(true)
     }
 
-    pub(crate) fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
-        self.handler.replace_text_in_range(None, input, window, cx);
+    pub(crate) fn dispatch_input(&mut self, input: &str) {
+        self.cx
+            .update(|window, cx| {
+                window.with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                    handler.replace_text_in_range(None, input, window, cx);
+                });
+            })
+            .ok();
     }
 
-    pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
-        let selection = self.handler.selected_text_range(true, window, cx)?;
-        self.handler.bounds_for_range(
-            if selection.reversed {
-                selection.range.start..selection.range.start
-            } else {
-                selection.range.end..selection.range.end
-            },
-            window,
-            cx,
-        )
+    pub fn selected_bounds(&mut self) -> Option<Bounds<Pixels>> {
+        self.cx
+            .update(|window, cx| {
+                window
+                    .with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                        let selection = handler.selected_text_range(true, window, cx)?;
+                        let range = if selection.reversed {
+                            selection.range.start..selection.range.start
+                        } else {
+                            selection.range.end..selection.range.end
+                        };
+                        handler.bounds_for_range(range, window, cx)
+                    })
+                    .flatten()
+            })
+            .ok()
+            .flatten()
     }
 
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                window
+                    .with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                        handler.character_index_for_point(point, window, cx)
+                    })
+                    .flatten()
+            })
             .ok()
             .flatten()
     }
 
     #[allow(dead_code)]
-    pub(crate) fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
-        self.handler.accepts_text_input(window, cx)
+    pub(crate) fn accepts_text_input(&mut self) -> bool {
+        self.cx
+            .update(|window, cx| {
+                window.with_input_handler_mut(self.fiber_id, cx, |handler, window, cx| {
+                    handler.accepts_text_input(window, cx)
+                })
+            })
+            .ok()
+            .flatten()
+            .unwrap_or(false)
     }
 }
 

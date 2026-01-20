@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use gpui::{FontWeight, HighlightStyle, StyledText};
+use gpui::{FontWeight, HighlightStyle, TextElement};
 
 use crate::{LabelCommon, LabelLike, LabelSize, LineHeightStyle, prelude::*};
 
@@ -141,7 +141,7 @@ impl RenderOnce for HighlightedLabel {
         text_style.color = self.base.color.color(cx);
 
         self.base
-            .child(StyledText::new(self.label).with_default_highlights(&text_style, highlights))
+            .child(self.label.with_default_highlights(&text_style, highlights))
     }
 }
 

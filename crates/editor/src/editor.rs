@@ -108,8 +108,8 @@ use gpui::{
     DispatchPhase, Edges, Entity, EntityInputHandler, EventEmitter, FocusHandle, FocusOutEvent,
     Focusable, FontId, FontWeight, Global, HighlightStyle, Hsla, KeyContext, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, ParentElement, Pixels, PressureStage,
-    Render, ScrollHandle, SharedString, SharedUri, Size, Stateful, Styled, Subscription, Task,
-    TextRun, TextStyle, TextStyleRefinement, UTF16Selection, UnderlineStyle,
+    Render, ScrollHandle, SharedString, SharedUri, Size, Styled, Subscription, Task,
+    TextElement, TextRun, TextStyle, TextStyleRefinement, UTF16Selection, UnderlineStyle,
     UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window, div, point, prelude::*,
     pulsating_between, px, relative, size,
 };
@@ -1259,6 +1259,8 @@ pub struct Editor {
     >,
     last_bounds: Option<Bounds<Pixels>>,
     last_position_map: Option<Rc<PositionMap>>,
+    #[cfg(any(test, feature = "test-support"))]
+    last_layout_snapshot: Option<crate::element::EditorLayoutSnapshot>,
     expect_bounds_change: Option<Bounds<Pixels>>,
     tasks: BTreeMap<(BufferId, BufferRow), RunnableTasks>,
     tasks_update_task: Option<Task<()>>,
@@ -1281,6 +1283,9 @@ pub struct Editor {
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
     focused_block: Option<FocusedBlock>,
+    fixed_block_max_width: Pixels,
+    pub(crate) block_height_cache: BlockHeightCache,
+    block_focus_handles: HashMap<BlockId, FocusHandle>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: HashMap<TypeId, Box<dyn Addon>>,
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
@@ -1802,6 +1807,93 @@ pub enum FormatTarget {
 pub(crate) struct FocusedBlock {
     id: BlockId,
     focus_handle: WeakFocusHandle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StyleGeneration(pub(crate) u64);
+
+const WIDTH_BUCKET_SIZE_PX: f32 = 12.0;
+
+#[derive(Default)]
+pub(crate) struct BlockHeightCache {
+    generations: HashMap<StyleGeneration, HashMap<(BlockId, u16), CachedHeight>>,
+    current_generation: StyleGeneration,
+}
+
+#[derive(Clone, Copy)]
+struct CachedHeight {
+    height_in_lines: u16,
+    line_height_px: f32,
+}
+
+impl BlockHeightCache {
+    pub(crate) fn advance_generation(&mut self, new_generation: StyleGeneration) {
+        self.generations
+            .retain(|generation, _| generation.0 + 2 > new_generation.0);
+        self.current_generation = new_generation;
+    }
+
+    pub(crate) fn get_height_in_lines(
+        &self,
+        block_id: BlockId,
+        width: Pixels,
+        line_height: Pixels,
+    ) -> Option<u16> {
+        let bucket = width_to_bucket(width);
+        let generation_map = self.generations.get(&self.current_generation)?;
+        let cached = generation_map.get(&(block_id, bucket))?;
+        if (cached.line_height_px - line_height.0).abs() < 0.1 {
+            Some(cached.height_in_lines)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn update_height_in_lines(
+        &mut self,
+        block_id: BlockId,
+        width: Pixels,
+        line_height: Pixels,
+        height_in_lines: u16,
+    ) -> bool {
+        let bucket = width_to_bucket(width);
+        let generation_map = self
+            .generations
+            .entry(self.current_generation)
+            .or_default();
+
+        let key = (block_id, bucket);
+        if let Some(cached) = generation_map.get(&key)
+            && cached.height_in_lines == height_in_lines
+            && (cached.line_height_px - line_height.0).abs() < 0.1
+        {
+            return false;
+        }
+
+        generation_map.insert(
+            key,
+            CachedHeight {
+                height_in_lines,
+                line_height_px: line_height.0,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn remove_block(&mut self, block_id: BlockId) {
+        for generation_map in self.generations.values_mut() {
+            generation_map.retain(|(id, _), _| *id != block_id);
+        }
+    }
+}
+
+fn width_to_bucket(width: Pixels) -> u16 {
+    let w = width.0.max(0.0).min(65535.0 * WIDTH_BUCKET_SIZE_PX);
+    if w.is_nan() {
+        0
+    } else {
+        (w / WIDTH_BUCKET_SIZE_PX).floor() as u16
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2412,6 +2504,8 @@ impl Editor {
             pixel_position_of_newest_cursor: None,
             last_bounds: None,
             last_position_map: None,
+            #[cfg(any(test, feature = "test-support"))]
+            last_layout_snapshot: None,
             expect_bounds_change: None,
             gutter_dimensions: GutterDimensions::default(),
             style: None,
@@ -2490,6 +2584,9 @@ impl Editor {
             previous_search_ranges: None,
             breadcrumb_header: None,
             focused_block: None,
+            fixed_block_max_width: Pixels::ZERO,
+            block_height_cache: BlockHeightCache::default(),
+            block_focus_handles: HashMap::default(),
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: HashMap::default(),
             registered_buffers: HashMap::default(),
@@ -3128,6 +3225,16 @@ impl Editor {
     #[cfg(any(test, feature = "test-support"))]
     pub fn completion_provider(&self) -> Option<Rc<dyn CompletionProvider>> {
         self.completion_provider.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_layout(&self) -> Option<&crate::element::EditorLayoutSnapshot> {
+        self.last_layout_snapshot.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_last_layout_snapshot(&mut self, snapshot: crate::element::EditorLayoutSnapshot) {
+        self.last_layout_snapshot = Some(snapshot);
     }
 
     pub fn semantics_provider(&self) -> Option<Rc<dyn SemanticsProvider>> {
@@ -9058,7 +9165,7 @@ impl Editor {
         style: &EditorStyle,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
+    ) -> Option<(AnyElement, Bounds<Pixels>)> {
         if self.mode().is_minimap() {
             return None;
         }
@@ -9156,16 +9263,16 @@ impl Editor {
                 cx,
             ),
             EditPrediction::MoveOutside { snapshot, .. } => {
-                let mut element = self
+                let element = self
                     .render_edit_prediction_jump_outside_popover(snapshot, window, cx)
                     .into_any();
-
-                let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+                let default_size =
+                    size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+                let (element, size) =
+                    window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
                 let origin_x = text_bounds.size.width - size.width - px(30.);
                 let origin = text_bounds.origin + gpui::Point::new(origin_x, px(16.));
-                element.prepaint_at(origin, window, cx);
-
-                Some((element, origin))
+                Some((element, Bounds::new(origin, size)))
             }
         }
     }
@@ -9182,7 +9289,7 @@ impl Editor {
         target_display_point: DisplayPoint,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
+    ) -> Option<(AnyElement, Bounds<Pixels>)> {
         let scrolled_content_origin =
             content_origin - gpui::Point::new(scroll_pixel_position.x.into(), Pixels::ZERO);
 
@@ -9227,7 +9334,7 @@ impl Editor {
         let mut border_color = Self::edit_prediction_callout_popover_border_color(cx);
         border_color.l += 0.001;
 
-        let mut element = v_flex()
+        let element = v_flex()
             .items_end()
             .when(flag_on_right, |el| el.items_start())
             .child(if flag_on_right {
@@ -9246,7 +9353,10 @@ impl Editor {
             .child(div().w(POLE_WIDTH).bg(border_color).h(line_height))
             .into_any();
 
-        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let default_size =
+            size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+        let (element, size) =
+            window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
 
         let mut origin = scrolled_content_origin + point(target_x, target_y.into())
             - point(
@@ -9259,10 +9369,7 @@ impl Editor {
             );
 
         origin.x = origin.x.max(content_origin.x);
-
-        element.prepaint_at(origin, window, cx);
-
-        Some((element, origin))
+        Some((element, Bounds::new(origin, size)))
     }
 
     fn render_edit_prediction_scroll_popover(
@@ -9275,12 +9382,15 @@ impl Editor {
         scrolled_content_origin: gpui::Point<Pixels>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
-        let mut element = self
+    ) -> Option<(AnyElement, Bounds<Pixels>)> {
+        let element = self
             .render_edit_prediction_line_popover("Scroll", Some(scroll_icon), window, cx)
             .into_any();
 
-        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let default_size =
+            size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+        let (element, size) =
+            window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
 
         let cursor = newest_selection_head?;
         let cursor_row_layout =
@@ -9291,8 +9401,7 @@ impl Editor {
 
         let origin = scrolled_content_origin + point(cursor_character_x, to_y(size));
 
-        element.prepaint_at(origin, window, cx);
-        Some((element, origin))
+        Some((element, Bounds::new(origin, size)))
     }
 
     fn render_edit_prediction_eager_jump_popover(
@@ -9309,9 +9418,9 @@ impl Editor {
         editor_width: Pixels,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
+    ) -> Option<(AnyElement, Bounds<Pixels>)> {
         if target_display_point.row().as_f64() < scroll_top {
-            let mut element = self
+            let element = self
                 .render_edit_prediction_line_popover(
                     "Jump to Edit",
                     Some(IconName::ArrowUp),
@@ -9320,17 +9429,19 @@ impl Editor {
                 )
                 .into_any();
 
-            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+            let default_size =
+                size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+            let (element, size) =
+                window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
             let offset = point(
                 (text_bounds.size.width - size.width) / 2.,
                 Self::EDIT_PREDICTION_POPOVER_PADDING_Y,
             );
 
             let origin = text_bounds.origin + offset;
-            element.prepaint_at(origin, window, cx);
-            Some((element, origin))
+            Some((element, Bounds::new(origin, size)))
         } else if (target_display_point.row().as_f64() + 1.) > scroll_bottom {
-            let mut element = self
+            let element = self
                 .render_edit_prediction_line_popover(
                     "Jump to Edit",
                     Some(IconName::ArrowDown),
@@ -9339,15 +9450,17 @@ impl Editor {
                 )
                 .into_any();
 
-            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+            let default_size =
+                size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+            let (element, size) =
+                window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
             let offset = point(
                 (text_bounds.size.width - size.width) / 2.,
                 text_bounds.size.height - size.height - Self::EDIT_PREDICTION_POPOVER_PADDING_Y,
             );
 
             let origin = text_bounds.origin + offset;
-            element.prepaint_at(origin, window, cx);
-            Some((element, origin))
+            Some((element, Bounds::new(origin, size)))
         } else {
             self.render_edit_prediction_end_of_line_popover(
                 "Jump to Edit",
@@ -9376,17 +9489,20 @@ impl Editor {
         editor_width: Pixels,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
+    ) -> Option<(AnyElement, Bounds<Pixels>)> {
         let target_line_end = DisplayPoint::new(
             target_display_point.row(),
             editor_snapshot.line_len(target_display_point.row()),
         );
 
-        let mut element = self
+        let element = self
             .render_edit_prediction_line_popover(label, None, window, cx)
             .into_any();
 
-        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let default_size =
+            size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+        let (mut element, mut size) =
+            window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
 
         let line_origin =
             self.display_to_pixel_point(target_line_end, editor_snapshot, window, cx)?;
@@ -9410,17 +9526,21 @@ impl Editor {
                 IconName::ArrowDown
             };
 
-            element = self
+            let element_with_icon = self
                 .render_edit_prediction_line_popover(label, Some(icon), window, cx)
                 .into_any();
-
-            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+            element = element_with_icon;
+            let default_size =
+                size(rems(20.).to_pixels(window.rem_size()), rems(6.).to_pixels(window.rem_size()));
+            let (wrapped, measured) =
+                window.with_cached_measurement(element, AvailableSpace::min_size(), default_size);
+            element = wrapped;
+            size = measured;
 
             origin.x = content_origin.x + editor_width - size.width - px(2.);
         }
 
-        element.prepaint_at(origin, window, cx);
-        Some((element, origin))
+        Some((element, Bounds::new(origin, size)))
     }
 
     fn render_edit_prediction_diff_popover(
@@ -9442,7 +9562,7 @@ impl Editor {
         snapshot: &language::BufferSnapshot,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
+    ) -> Option<(AnyElement, Bounds<Pixels>)> {
         let edit_start = edits
             .first()
             .unwrap()
@@ -9469,15 +9589,16 @@ impl Editor {
             crate::edit_prediction_fallback_text(edits, cx)
         };
 
-        let styled_text = highlighted_edits.to_styled_text(&style.text);
+        let styled_text_for_measure = highlighted_edits.to_styled_text(&style.text);
         let line_count = highlighted_edits.text.lines().count();
 
         const BORDER_WIDTH: Pixels = px(1.);
 
+        let keybind_for_measure = self.render_edit_prediction_accept_keybind(window, cx);
+        let has_keybind = keybind_for_measure.is_some();
         let keybind = self.render_edit_prediction_accept_keybind(window, cx);
-        let has_keybind = keybind.is_some();
 
-        let mut element = h_flex()
+        let _element_for_measure = h_flex()
             .items_start()
             .child(
                 h_flex()
@@ -9488,7 +9609,7 @@ impl Editor {
                     .rounded_l_lg()
                     .when(line_count > 1, |el| el.rounded_br_lg())
                     .pr_1()
-                    .child(styled_text),
+                    .child(styled_text_for_measure),
             )
             .child(
                 h_flex()
@@ -9519,9 +9640,11 @@ impl Editor {
                                 cx.new(|_| MissingEditPredictionKeybindingTooltip).into()
                             })
                     })
-                    .children(keybind),
+                    .children(keybind_for_measure),
             )
             .into_any();
+
+        let styled_text = highlighted_edits.to_styled_text(&style.text);
 
         let longest_row =
             editor_snapshot.longest_row_in_range(edit_start.row()..edit_end.row() + 1);
@@ -9552,7 +9675,13 @@ impl Editor {
             ) - scroll_pixel_position.x,
         );
 
-        let element_bounds = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let measurement_key = gpui::MeasurementKey::for_callsite(0);
+        let measurement_constraints = AvailableSpace::min_size();
+        let measurement_default_size =
+            size(rems(32.).to_pixels(window.rem_size()), rems(16.).to_pixels(window.rem_size()));
+        let element_bounds = window
+            .measured_size_for(measurement_key, measurement_constraints)
+            .unwrap_or(measurement_default_size);
 
         // Fully visible if it can be displayed within the window (allow overlapping other
         // panes). However, this is only allowed if the popover starts within text_bounds.
@@ -9604,6 +9733,65 @@ impl Editor {
         };
 
         origin.x -= BORDER_WIDTH;
+
+        let element = h_flex()
+            .items_start()
+            .child(
+                h_flex()
+                    .bg(cx.theme().colors().editor_background)
+                    .border(BORDER_WIDTH)
+                    .shadow_xs()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_l_lg()
+                    .when(line_count > 1, |el| el.rounded_br_lg())
+                    .pr_1()
+                    .child(styled_text),
+            )
+            .child(
+                h_flex()
+                    .h(line_height + BORDER_WIDTH * 2.)
+                    .px_1p5()
+                    .gap_1()
+                    // Workaround: For some reason, there's a gap if we don't do this
+                    .ml(-BORDER_WIDTH)
+                    .shadow(vec![gpui::BoxShadow {
+                        color: gpui::black().opacity(0.05),
+                        offset: point(px(1.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                    }])
+                    .bg(Editor::edit_prediction_line_popover_bg_color(cx))
+                    .border(BORDER_WIDTH)
+                    .border_color(cx.theme().colors().border)
+                    .rounded_r_lg()
+                    .id("edit_prediction_diff_popover_keybind")
+                    .when(!has_keybind, |el| {
+                        let status_colors = cx.theme().status();
+
+                        el.bg(status_colors.error_background)
+                            .border_color(status_colors.error.opacity(0.6))
+                            .child(Icon::new(IconName::Info).color(Color::Error))
+                            .cursor_default()
+                            .hoverable_tooltip(move |_window, cx| {
+                                cx.new(|_| MissingEditPredictionKeybindingTooltip).into()
+                            })
+                    })
+                    .children(keybind),
+            )
+            .into_any();
+
+        let element = div()
+            .child(element)
+            .on_layout(move |bounds, window, _cx| {
+                if window.record_measured_size_for(
+                    measurement_key,
+                    measurement_constraints,
+                    bounds.size,
+                ) {
+                    window.refresh();
+                }
+            })
+            .into_any();
 
         window.defer_draw(element, origin, 1);
 
@@ -9674,7 +9862,7 @@ impl Editor {
         icon: Option<IconName>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let padding_right = if icon.is_some() { px(4.) } else { px(8.) };
 
         let keybind = self.render_edit_prediction_accept_keybind(window, cx);
@@ -9734,7 +9922,7 @@ impl Editor {
         snapshot: &BufferSnapshot,
         window: &mut Window,
         cx: &mut App,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let keybind = self.render_edit_prediction_accept_keybind(window, cx);
         let has_keybind = keybind.is_some();
 
@@ -10098,7 +10286,8 @@ impl Editor {
                         crate::edit_prediction_fallback_text(edits, cx).first_line_preview()
                     };
 
-                let styled_text = gpui::StyledText::new(highlighted_edits.text)
+                let styled_text = highlighted_edits
+                    .text
                     .with_default_highlights(&style.text, highlighted_edits.highlights);
 
                 let preview = h_flex()
@@ -20583,6 +20772,12 @@ impl Editor {
         autoscroll: Option<Autoscroll>,
         cx: &mut Context<Self>,
     ) {
+        for &custom_id in block_ids.iter() {
+            let block_id = BlockId::Custom(custom_id);
+            self.block_height_cache.remove_block(block_id);
+            self.block_focus_handles.remove(&block_id);
+        }
+
         self.display_map.update(cx, |display_map, cx| {
             display_map.remove_blocks(block_ids, cx)
         });
@@ -20607,6 +20802,28 @@ impl Editor {
 
     pub(crate) fn take_focused_block(&mut self) -> Option<FocusedBlock> {
         self.focused_block.take()
+    }
+
+    pub(crate) fn fixed_block_max_width(&self) -> Pixels {
+        self.fixed_block_max_width
+    }
+
+    pub(crate) fn set_fixed_block_max_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.fixed_block_max_width != width {
+            self.fixed_block_max_width = width;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn focus_handle_for_block(
+        &mut self,
+        block_id: BlockId,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.block_focus_handles
+            .entry(block_id)
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
     }
 
     pub fn insert_creases(

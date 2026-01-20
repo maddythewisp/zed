@@ -2,7 +2,7 @@ use crate::file_finder_settings::FileFinderSettings;
 use file_icons::FileIcons;
 use futures::channel::oneshot;
 use fuzzy::{CharBag, StringMatch, StringMatchCandidate};
-use gpui::{HighlightStyle, StyledText, Task};
+use gpui::{HighlightStyle, Task, TextElement};
 use picker::{Picker, PickerDelegate};
 use project::{DirectoryItem, DirectoryLister};
 use settings::Settings;
@@ -765,7 +765,7 @@ impl PickerDelegate for OpenPathDelegate {
                                 } else {
                                     format!("{label} (replace)")
                                 };
-                                StyledText::new(label)
+                                label
                                     .with_default_highlights(
                                         &window.text_style(),
                                         vec![(
@@ -775,7 +775,7 @@ impl PickerDelegate for OpenPathDelegate {
                                     )
                                     .into_any_element()
                             } else {
-                                StyledText::new(format!("{label} (create)"))
+                                format!("{label} (create)")
                                     .with_default_highlights(
                                         &window.text_style(),
                                         vec![(

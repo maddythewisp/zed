@@ -25,7 +25,7 @@ use project::{
 };
 use ui::{
     Divider, DividerColor, FluentBuilder as _, Indicator, IntoElement, ListItem, Render,
-    ScrollAxes, StatefulInteractiveElement, Tooltip, WithScrollbar, prelude::*,
+    ScrollAxes, Tooltip, WithScrollbar, prelude::*,
 };
 use util::rel_path::RelPath;
 use workspace::Workspace;

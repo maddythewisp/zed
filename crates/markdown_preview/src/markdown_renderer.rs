@@ -7,9 +7,8 @@ use crate::markdown_elements::{
 use fs::normalize_path;
 use gpui::{
     AbsoluteLength, AnyElement, App, AppContext as _, Context, Div, Element, ElementId, Entity,
-    HighlightStyle, Hsla, ImageSource, InteractiveText, IntoElement, Keystroke, Modifiers,
-    ParentElement, Render, Resource, SharedString, Styled, StyledText, TextStyle, WeakEntity,
-    Window, div, img, rems,
+    HighlightStyle, Hsla, ImageSource, IntoElement, Keystroke, Modifiers, ParentElement, Render,
+    Resource, SharedString, Styled, TextElement, TextStyle, WeakEntity, Window, div, img, rems,
 };
 use settings::Settings;
 use std::{
@@ -611,7 +610,7 @@ fn render_markdown_code_block(
     cx: &mut RenderContext,
 ) -> AnyElement {
     let body = if let Some(highlights) = parsed.highlights.as_ref() {
-        StyledText::new(parsed.contents.clone()).with_default_highlights(
+        parsed.contents.clone().with_default_highlights(
             &cx.buffer_text_style,
             highlights.iter().filter_map(|(range, highlight_id)| {
                 highlight_id
@@ -620,7 +619,7 @@ fn render_markdown_code_block(
             }),
         )
     } else {
-        StyledText::new(parsed.contents.clone())
+        parsed.contents.clone().with_highlights([])
     };
 
     let copy_block_button = CopyButton::new(parsed.contents.clone())
@@ -671,8 +670,6 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
     for parsed_region in parsed_new {
         match parsed_region {
             MarkdownParagraphChunk::Text(parsed) => {
-                let element_id = cx.next_id(&parsed.source_range);
-
                 let highlights = gpui::combine_highlights(
                     parsed.highlights.iter().filter_map(|(range, highlight)| {
                         highlight
@@ -712,46 +709,48 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
                 let workspace = workspace_clone.clone();
                 let element = div()
                     .child(
-                        InteractiveText::new(
-                            element_id,
-                            StyledText::new(parsed.contents.clone())
-                                .with_default_highlights(&text_style, highlights),
-                        )
-                        .tooltip({
-                            let links = links.clone();
-                            let link_ranges = link_ranges.clone();
-                            move |idx, _, cx| {
-                                for (ix, range) in link_ranges.iter().enumerate() {
-                                    if range.contains(&idx) {
-                                        return Some(LinkPreview::new(&links[ix].to_string(), cx));
+                        parsed
+                            .contents
+                            .clone()
+                            .with_default_highlights(&text_style, highlights)
+                            .tooltip({
+                                let links = links.clone();
+                                let link_ranges = link_ranges.clone();
+                                move |idx, _, cx| {
+                                    for (ix, range) in link_ranges.iter().enumerate() {
+                                        if range.contains(&idx) {
+                                            return Some(LinkPreview::new(
+                                                &links[ix].to_string(),
+                                                cx,
+                                            ));
+                                        }
                                     }
+                                    None
                                 }
-                                None
-                            }
-                        })
-                        .on_click(
-                            link_ranges,
-                            move |clicked_range_ix, window, cx| match &links[clicked_range_ix] {
-                                Link::Web { url } => cx.open_url(url),
-                                Link::Path { path, .. } => {
-                                    if let Some(workspace) = &workspace {
-                                        _ = workspace.update(cx, |workspace, cx| {
-                                            workspace
-                                                .open_abs_path(
-                                                    normalize_path(path.clone().as_path()),
-                                                    OpenOptions {
-                                                        visible: Some(OpenVisible::None),
-                                                        ..Default::default()
-                                                    },
-                                                    window,
-                                                    cx,
-                                                )
-                                                .detach();
-                                        });
+                            })
+                            .on_click(
+                                link_ranges,
+                                move |clicked_range_ix, window, cx| match &links[clicked_range_ix] {
+                                    Link::Web { url } => cx.open_url(url),
+                                    Link::Path { path, .. } => {
+                                        if let Some(workspace) = &workspace {
+                                            _ = workspace.update(cx, |workspace, cx| {
+                                                workspace
+                                                    .open_abs_path(
+                                                        normalize_path(path.clone().as_path()),
+                                                        OpenOptions {
+                                                            visible: Some(OpenVisible::None),
+                                                            ..Default::default()
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    )
+                                                    .detach();
+                                            });
+                                        }
                                     }
-                                }
-                            },
-                        ),
+                                },
+                            ),
                     )
                     .into_any();
                 any_element.push(element);

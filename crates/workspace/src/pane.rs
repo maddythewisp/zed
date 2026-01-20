@@ -23,7 +23,7 @@ use gpui::{
     DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
     Focusable, KeyContext, MouseButton, MouseDownEvent, NavigationDirection, Pixels, Point,
     PromptLevel, Render, ScrollHandle, Subscription, Task, WeakEntity, WeakFocusHandle, Window,
-    actions, anchored, deferred, prelude::*,
+    actions, anchored, prelude::*,
 };
 use itertools::Itertools;
 use language::{Capability, DiagnosticSeverity};
@@ -3648,7 +3648,7 @@ impl Pane {
 
     pub fn render_menu_overlay(menu: &Entity<ContextMenu>) -> Div {
         div().absolute().bottom_0().right_0().size_0().child(
-            deferred(anchored().anchor(Corner::TopRight).child(menu.clone())).with_priority(1),
+            anchored().anchor(Corner::TopRight).child(menu.clone()).z_index(1),
         )
     }
 

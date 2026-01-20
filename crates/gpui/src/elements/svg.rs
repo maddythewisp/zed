@@ -1,14 +1,19 @@
-use std::{fs, path::Path, sync::Arc};
+use gpui_macros::Element;
+use std::{any::TypeId, fs, path::Path, sync::Arc};
 
 use crate::{
-    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, geometry::Negate as _, point, px,
-    radians, size,
+    App, Asset, AvailableSpace, Bounds, ElementId, ElementImpl,
+    InteractiveElement, Interactivity, IntoElement, Pixels, Point, Radians, RenderNode,
+    SharedString, Size, StyleRefinement, Styled, TransformationMatrix, UpdateResult, Window,
+    point, px, radians, size, taffy::ToTaffy,
 };
-use util::ResultExt;
+use futures::Future;
+use refineable::Refineable;
+use taffy::style::Style as TaffyStyle;
 
 /// An SVG element.
+#[derive(Element)]
+#[element(crate = crate)]
 pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<Transformation>,
@@ -46,13 +51,14 @@ impl Svg {
         self.transformation = Some(transformation);
         self
     }
+
+    pub(crate) fn take_interactivity(&mut self) -> Interactivity {
+        std::mem::take(&mut self.interactivity)
+    }
 }
 
-impl Element for Svg {
-    type RequestLayoutState = ();
-    type PrepaintState = Option<Hitbox>;
-
-    fn id(&self) -> Option<crate::ElementId> {
+impl ElementImpl for Svg {
+    fn id(&self) -> Option<ElementId> {
         self.interactivity.element_id.clone()
     }
 
@@ -60,106 +66,64 @@ impl Element for Svg {
         self.interactivity.source_location()
     }
 
-    fn request_layout(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout_id = self.interactivity.request_layout(
-            global_id,
-            inspector_id,
-            window,
-            cx,
-            |style, window, cx| window.request_layout(style, None, cx),
-        );
-        (layout_id, ())
+    fn cached_style(&self) -> Option<&StyleRefinement> {
+        Some(&self.interactivity.base_style)
     }
 
-    fn prepaint(
+    fn take_layout_listener(
         &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<Hitbox> {
-        self.interactivity.prepaint(
-            global_id,
-            inspector_id,
-            bounds,
-            bounds.size,
-            window,
-            cx,
-            |_, _, hitbox, _, _| hitbox,
-        )
+    ) -> Option<Box<dyn FnMut(Bounds<Pixels>, &mut Window, &mut App) + 'static>> {
+        self.interactivity.layout_listener.take()
     }
 
-    fn paint(
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        Some(Box::new(SvgNode::new(
+            self.take_interactivity(),
+            self.path.take(),
+            self.external_path.take(),
+            self.transformation.take(),
+        )))
+    }
+
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<SvgNode>())
+    }
+
+    fn update_render_node(
         &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        hitbox: &mut Option<Hitbox>,
-        window: &mut Window,
-        cx: &mut App,
-    ) where
-        Self: Sized,
-    {
-        self.interactivity.paint(
-            global_id,
-            inspector_id,
-            bounds,
-            hitbox.as_ref(),
-            window,
-            cx,
-            |style, window, cx| {
-                if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| {
-                            transformation.into_matrix(bounds.center(), window.scale_factor())
-                        })
-                        .unwrap_or_default();
+        node: &mut dyn RenderNode,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UpdateResult> {
+        if let Some(svg_node) = node.as_any_mut().downcast_mut::<SvgNode>() {
+            let interactivity = self.take_interactivity();
+            let update_result = svg_node.interactivity.diff_styles(&interactivity);
 
-                    window
-                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
-                        .log_err();
-                } else if let Some((path, color)) =
-                    self.external_path.as_ref().zip(style.text.color)
-                {
-                    let Some(bytes) = window
-                        .use_asset::<SvgAsset>(path, cx)
-                        .and_then(|asset| asset.log_err())
-                    else {
-                        return;
-                    };
+            let path = self.path.take();
+            let external_path = self.external_path.take();
+            let transformation = self.transformation.take();
 
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| {
-                            transformation.into_matrix(bounds.center(), window.scale_factor())
-                        })
-                        .unwrap_or_default();
+            let content_changed = svg_node.path != path
+                || svg_node.external_path != external_path
+                || svg_node.transformation != transformation;
 
-                    window
-                        .paint_svg(
-                            bounds,
-                            path.clone(),
-                            Some(&bytes),
-                            transformation,
-                            color,
-                            cx,
-                        )
-                        .log_err();
-                }
-            },
-        )
+            let mut layout_changed = update_result.layout_changed;
+            let mut paint_changed = update_result.paint_changed;
+            if content_changed {
+                paint_changed = true;
+            }
+            if layout_changed {
+                paint_changed = true;
+            }
+
+            svg_node.update_from(interactivity, path, external_path, transformation);
+            Some(UpdateResult {
+                layout_changed,
+                paint_changed,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -248,17 +212,28 @@ impl Transformation {
         self
     }
 
-    fn into_matrix(self, center: Point<Pixels>, scale_factor: f32) -> TransformationMatrix {
+    pub(crate) fn into_matrix(
+        self,
+        center: Point<Pixels>,
+        scale_factor: f32,
+    ) -> TransformationMatrix {
+        // MonochromeSprite bounds are in device (ScaledPixels) space, so the transform
+        // must also be in device space. Scale the translation values accordingly.
         //Note: if you read this as a sequence of matrix multiplications, start from the bottom
+        let scaled_center = point(px(center.x.0 * scale_factor), px(center.y.0 * scale_factor));
+        let scaled_translate = point(
+            px(self.translate.x.0 * scale_factor),
+            px(self.translate.y.0 * scale_factor),
+        );
         TransformationMatrix::unit()
-            .translate(center.scale(scale_factor) + self.translate.scale(scale_factor))
+            .translate(scaled_center + scaled_translate)
             .rotate(self.rotate)
             .scale(self.scale)
-            .translate(center.scale(scale_factor).negate())
+            .translate(point(px(-scaled_center.x.0), px(-scaled_center.y.0)))
     }
 }
 
-enum SvgAsset {}
+pub(crate) enum SvgAsset {}
 
 impl Asset for SvgAsset {
     type Source = SharedString;
@@ -273,5 +248,166 @@ impl Asset for SvgAsset {
             let bytes = Arc::from(bytes);
             Ok(bytes)
         }
+    }
+}
+
+/// Retained render node for SVG elements.
+///
+/// This node owns all SVG-specific data including Interactivity, enabling
+/// the node to fully handle layout, prepaint, and paint phases.
+pub(crate) struct SvgNode {
+    /// Interactivity state for this SVG element.
+    pub interactivity: Interactivity,
+    /// Path to the SVG content (inline or asset).
+    pub path: Option<SharedString>,
+    /// Path to an external SVG file.
+    pub external_path: Option<SharedString>,
+    /// Transformation to apply to the SVG.
+    pub transformation: Option<Transformation>,
+}
+
+impl SvgNode {
+    /// Create a new SvgNode from descriptor data.
+    pub fn new(
+        interactivity: Interactivity,
+        path: Option<SharedString>,
+        external_path: Option<SharedString>,
+        transformation: Option<Transformation>,
+    ) -> Self {
+        Self {
+            interactivity,
+            path,
+            external_path,
+            transformation,
+        }
+    }
+
+    /// Update this node from a descriptor.
+    pub fn update_from(
+        &mut self,
+        interactivity: Interactivity,
+        path: Option<SharedString>,
+        external_path: Option<SharedString>,
+        transformation: Option<Transformation>,
+    ) {
+        self.interactivity = interactivity;
+        self.path = path;
+        self.external_path = external_path;
+        self.transformation = transformation;
+    }
+}
+
+impl RenderNode for SvgNode {
+    fn taffy_style(&self, rem_size: crate::Pixels, scale_factor: f32) -> TaffyStyle {
+        // Compute taffy style from interactivity.base_style
+        let mut style = crate::Style::default();
+        style.refine(&self.interactivity.base_style);
+        style.to_taffy(rem_size, scale_factor)
+    }
+
+    fn compute_intrinsic_size(
+        &mut self,
+        _ctx: &mut crate::SizingCtx,
+    ) -> crate::IntrinsicSizeResult {
+        crate::IntrinsicSizeResult {
+            size: crate::IntrinsicSize::default(),
+            input: crate::SizingInput::default(),
+        }
+    }
+
+    fn uses_intrinsic_sizing_cache(&self) -> bool {
+        // SVG nodes don't currently compute intrinsic sizes. Use `measure` instead so first-layout
+        // measurement never depends on an intrinsic sizing pass having run.
+        false
+    }
+
+    fn measure(
+        &mut self,
+        _known: Size<Option<Pixels>>,
+        _available: Size<AvailableSpace>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Size<Pixels>> {
+        Some(Size {
+            width: Pixels(0.0),
+            height: Pixels(0.0),
+        })
+    }
+
+    fn layout_begin(&mut self, _ctx: &mut crate::LayoutCtx) -> crate::LayoutFrame {
+        crate::LayoutFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_begin(&mut self, ctx: &mut crate::PrepaintCtx) -> crate::PrepaintFrame {
+        // Call prepare_prepaint to set up hitbox and event handlers
+        let hitbox = self.interactivity.prepaint(
+            Some(&ctx.fiber_id),
+            ctx.inspector_id.as_ref(),
+            ctx.bounds,
+            ctx.bounds.size,
+            ctx.window,
+            ctx.cx,
+            |_, _, hitbox, _, _| hitbox,
+        );
+
+        crate::PrepaintFrame {
+            handled: true,
+            skip_children: true, // SVG is always a leaf node
+            hitbox,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_end(&mut self, _ctx: &mut crate::PrepaintCtx, _frame: crate::PrepaintFrame) {
+        // Nothing to pop for SVG - it doesn't push any context
+    }
+
+    fn paint_begin(&mut self, ctx: &mut crate::PaintCtx) -> crate::PaintFrame {
+        // Get hitbox from window (registered during prepaint)
+        let hitbox = ctx.window.resolve_hitbox(&ctx.fiber_id);
+
+        // Use interactivity.paint which handles style resolution, shadows, borders, etc.
+        // The closure does SVG-specific painting
+        let path = self.path.clone();
+        let external_path = self.external_path.clone();
+        let transformation = self.transformation;
+
+        self.interactivity.paint(
+            Some(&ctx.fiber_id),
+            ctx.inspector_id.as_ref(),
+            ctx.bounds,
+            hitbox.as_ref(),
+            ctx.window,
+            ctx.cx,
+            |style, window, cx| {
+                if let Some(color) = style.text.color {
+                    window.paint_svg_paths(
+                        ctx.bounds,
+                        path.as_ref(),
+                        external_path.as_ref(),
+                        transformation,
+                        color,
+                        cx,
+                    );
+                }
+            },
+        );
+
+        crate::PaintFrame {
+            handled: true,
+            skip_children: true, // SVG is always a leaf node
+            ..Default::default()
+        }
+    }
+
+    fn paint_end(&mut self, _ctx: &mut crate::PaintCtx, _frame: crate::PaintFrame) {
+        // Nothing to pop for SVG - it doesn't push any context
+    }
+
+    fn interactivity(&self) -> Option<&crate::Interactivity> {
+        Some(&self.interactivity)
     }
 }

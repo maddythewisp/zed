@@ -1,6 +1,6 @@
 use gpui::{
     App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString,
-    Stateful, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 
 actions!(example, [Tab, TabPrev, Quit]);
@@ -58,7 +58,7 @@ impl Example {
 
 impl Render for Example {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        fn button_base(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
+        fn button_base(id: impl Into<ElementId>, label: &'static str) -> Div {
             div()
                 .id(id)
                 .h_16()

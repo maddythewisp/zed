@@ -1,192 +1,159 @@
+use crate::window::context::PrepaintCx;
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, Length, Pixels, Point, Size, Style, Window,
-    point, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GlobalElementId, Length, Pixels, Point,
+    Size, Style, Window, point, size,
 };
-use collections::{FxHashMap, FxHashSet};
-use stacksafe::{StackSafe, stacksafe};
-use std::{fmt::Debug, ops::Range};
+use collections::FxHashMap;
+use slotmap::DefaultKey;
+use smallvec::SmallVec;
+use std::{fmt::Debug, hash::Hash, mem, ops::Range};
 use taffy::{
-    TaffyTree, TraversePartialTree as _,
+    compute_root_layout,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
     prelude::min_content,
+    round_layout,
     style::AvailableSpace as TaffyAvailableSpace,
     tree::NodeId,
 };
 
-type NodeMeasureFn = StackSafe<
-    Box<
-        dyn FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>,
-    >,
->;
+/// A unique identifier for a layout node.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+#[repr(transparent)]
+pub struct LayoutId(NodeId);
 
-struct NodeContext {
-    measure: NodeMeasureFn,
+impl From<LayoutId> for NodeId {
+    fn from(layout_id: LayoutId) -> NodeId {
+        layout_id.0
+    }
 }
+
+impl From<NodeId> for LayoutId {
+    fn from(node_id: NodeId) -> Self {
+        LayoutId(node_id)
+    }
+}
+
 pub struct TaffyLayoutEngine {
-    taffy: TaffyTree<NodeContext>,
-    absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
-    computed_layouts: FxHashSet<LayoutId>,
-    layout_bounds_scratch_space: Vec<LayoutId>,
+    pub(crate) pending_measure_calls: Vec<GlobalElementId>,
+    pub(crate) fibers_layout_changed: Vec<GlobalElementId>,
+    pub(crate) last_layout_viewport_size: Option<Size<Pixels>>,
 }
-
-const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
 
 impl TaffyLayoutEngine {
     pub fn new() -> Self {
-        let mut taffy = TaffyTree::new();
-        taffy.enable_rounding();
-        TaffyLayoutEngine {
-            taffy,
-            absolute_layout_bounds: FxHashMap::default(),
-            computed_layouts: FxHashSet::default(),
-            layout_bounds_scratch_space: Vec::new(),
+        Self {
+            pending_measure_calls: Vec::new(),
+            fibers_layout_changed: Vec::new(),
+            last_layout_viewport_size: None,
         }
     }
+}
 
-    pub fn clear(&mut self) {
-        self.taffy.clear();
-        self.absolute_layout_bounds.clear();
-        self.computed_layouts.clear();
-    }
-
-    pub fn request_layout(
+impl TaffyLayoutEngine {
+    pub(crate) fn request_layout<I>(
         &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        children: &[LayoutId],
-    ) -> LayoutId {
-        let taffy_style = style.to_taffy(rem_size, scale_factor);
-
-        if children.is_empty() {
-            self.taffy
-                .new_leaf(taffy_style)
-                .expect(EXPECT_MESSAGE)
-                .into()
-        } else {
-            self.taffy
-                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
-                .expect(EXPECT_MESSAGE)
-                .into()
-        }
-    }
-
-    pub fn request_measured_layout(
-        &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>
-        + 'static,
-    ) -> LayoutId {
-        let taffy_style = style.to_taffy(rem_size, scale_factor);
-
-        self.taffy
-            .new_leaf_with_context(
-                taffy_style,
-                NodeContext {
-                    measure: StackSafe::new(Box::new(measure)),
-                },
-            )
-            .expect(EXPECT_MESSAGE)
-            .into()
-    }
-
-    // Used to understand performance
-    #[allow(dead_code)]
-    fn count_all_children(&self, parent: LayoutId) -> anyhow::Result<u32> {
-        let mut count = 0;
-
-        for child in self.taffy.children(parent.0)? {
-            // Count this child.
-            count += 1;
-
-            // Count all of this child's children.
-            count += self.count_all_children(LayoutId(child))?
-        }
-
-        Ok(count)
-    }
-
-    // Used to understand performance
-    #[allow(dead_code)]
-    fn max_depth(&self, depth: u32, parent: LayoutId) -> anyhow::Result<u32> {
-        println!(
-            "{parent:?} at depth {depth} has {} children",
-            self.taffy.child_count(parent.0)
-        );
-
-        let mut max_child_depth = 0;
-
-        for child in self.taffy.children(parent.0)? {
-            max_child_depth = std::cmp::max(max_child_depth, self.max_depth(0, LayoutId(child))?);
-        }
-
-        Ok(depth + 1 + max_child_depth)
-    }
-
-    // Used to understand performance
-    #[allow(dead_code)]
-    fn get_edges(&self, parent: LayoutId) -> anyhow::Result<Vec<(LayoutId, LayoutId)>> {
-        let mut edges = Vec::new();
-
-        for child in self.taffy.children(parent.0)? {
-            edges.push((parent, LayoutId(child)));
-
-            edges.extend(self.get_edges(LayoutId(child))?);
-        }
-
-        Ok(edges)
-    }
-
-    #[stacksafe]
-    pub fn compute_layout(
-        &mut self,
-        id: LayoutId,
-        available_space: Size<AvailableSpace>,
         window: &mut Window,
-        cx: &mut App,
-    ) {
-        // Leaving this here until we have a better instrumentation approach.
-        // println!("Laying out {} children", self.count_all_children(id)?);
-        // println!("Max layout depth: {}", self.max_depth(0, id)?);
+        fiber_id: GlobalElementId,
+        style: Style,
+        _children: I,
+        _cx: &mut App,
+    ) -> LayoutId
+    where
+        I: IntoIterator<Item = LayoutId>,
+    {
+        let _ = self;
+        let rem_size = window.rem_size();
+        let scale_factor = window.scale_factor();
+        let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let _ = update_fiber_style(window, &fiber_id, taffy_style);
+        clear_fiber_measure_func(window, &fiber_id);
+        Self::layout_id(&fiber_id)
+    }
 
-        // Output the edges (branches) of the tree in Mermaid format for visualization.
-        // println!("Edges:");
-        // for (a, b) in self.get_edges(id)? {
-        //     println!("N{} --> N{}", u64::from(a), u64::from(b));
-        // }
-        //
+    pub(crate) fn request_measured_layout<F>(
+        &mut self,
+        window: &mut Window,
+        fiber_id: GlobalElementId,
+        style: Style,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        let _ = self;
+        let rem_size = window.rem_size();
+        let scale_factor = window.scale_factor();
+        let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let _ = update_fiber_style(window, &fiber_id, taffy_style);
+        window.fiber.tree.measure_funcs.insert(
+            fiber_id.into(),
+            crate::fiber::FiberMeasureData {
+                measure_func: Box::new(measure),
+                measure_hash: None,
+            },
+        );
+        window.fiber.tree.clear_taffy_cache_upwards(&fiber_id);
+        Self::layout_id(&fiber_id)
+    }
 
-        if !self.computed_layouts.insert(id) {
-            let mut stack = &mut self.layout_bounds_scratch_space;
-            stack.push(id);
-            while let Some(id) = stack.pop() {
-                self.absolute_layout_bounds.remove(&id);
-                stack.extend(
-                    self.taffy
-                        .children(id.into())
-                        .expect(EXPECT_MESSAGE)
-                        .into_iter()
-                        .map(LayoutId::from),
+    pub(crate) fn request_measured_layout_cached<F>(
+        &mut self,
+        window: &mut Window,
+        fiber_id: GlobalElementId,
+        style: Style,
+        content_hash: u64,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        let rem_size = window.rem_size();
+        let scale_factor = window.scale_factor();
+        let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let style_changed = update_fiber_style(window, &fiber_id, taffy_style);
+
+        let mut content_changed = true;
+        let measure_func = Box::new(measure);
+        let key: DefaultKey = fiber_id.into();
+        match window.fiber.tree.measure_funcs.get_mut(key) {
+            Some(data) => {
+                content_changed = data.measure_hash != Some(content_hash);
+                data.measure_hash = Some(content_hash);
+                data.measure_func = measure_func;
+            }
+            None => {
+                window.fiber.tree.measure_funcs.insert(
+                    key,
+                    crate::fiber::FiberMeasureData {
+                        measure_func,
+                        measure_hash: Some(content_hash),
+                    },
                 );
             }
         }
 
-        let scale_factor = window.scale_factor();
+        if style_changed || content_changed {
+            // Conservative fallback: invalidate caches immediately.
+            // Intrinsic sizing will replace this path once fully wired into the frame loop.
+            window.fiber.tree.clear_taffy_cache_upwards(&fiber_id);
+        } else {
+            self.pending_measure_calls.push(fiber_id);
+        }
 
-        let transform = |v: AvailableSpace| match v {
+        Self::layout_id(&fiber_id)
+    }
+
+    pub(crate) fn compute_layout(
+        &mut self,
+        window: &mut Window,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> usize {
+        let scale_factor = window.scale_factor();
+        let transform = |space: AvailableSpace| match space {
             AvailableSpace::Definite(pixels) => {
                 AvailableSpace::Definite(Pixels(pixels.0 * scale_factor))
             }
@@ -198,99 +165,354 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
-        self.taffy
-            .compute_layout_with_measure(
-                id.into(),
-                available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
-                    let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
-                    };
+        let mut fiber_tree = mem::take(&mut window.fiber.tree);
+        let island_root: GlobalElementId = layout_id.into();
+        fiber_tree.set_layout_context(
+            window as *mut Window,
+            cx as *mut App,
+            scale_factor,
+            island_root,
+        );
+        compute_root_layout(&mut fiber_tree, layout_id.into(), available_space.into());
+        round_layout(&mut fiber_tree, layout_id.into());
+        let layout_calls = fiber_tree.layout_calls();
+        if std::env::var("GPUI_DEBUG_LAYOUT").is_ok() && layout_calls > 0 {
+            log::info!("=== layout frame end: {} fibers ===", layout_calls);
+        }
+        fiber_tree.log_layout_cache_summary_if_enabled();
+        fiber_tree.clear_layout_context();
+        window.fiber.tree = fiber_tree;
 
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
-
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
-                        }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
-
-                    let a: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    size(a.width.0 * scale_factor, a.height.0 * scale_factor).into()
-                },
-            )
-            .expect(EXPECT_MESSAGE);
+        let pending_calls = mem::take(&mut self.pending_measure_calls);
+        let mut bounds_cache = FxHashMap::default();
+        for fiber_id in pending_calls {
+            let bounds = layout_bounds(window, &fiber_id, scale_factor, &mut bounds_cache);
+            let size: Size<Pixels> = bounds.size;
+            let key: DefaultKey = fiber_id.into();
+            let mut measure_data = window.fiber.tree.measure_funcs.remove(key);
+            if let Some(data) = measure_data.as_mut() {
+                (data.measure_func)(
+                    Size {
+                        width: Some(size.width),
+                        height: Some(size.height),
+                    },
+                    Size {
+                        width: AvailableSpace::Definite(size.width),
+                        height: AvailableSpace::Definite(size.height),
+                    },
+                    window,
+                    cx,
+                );
+            }
+            if let Some(data) = measure_data {
+                window.fiber.tree.measure_funcs.insert(key, data);
+            }
+        }
+        layout_calls
     }
 
-    pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
-        if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
-            return layout;
-        }
+    pub(crate) fn compute_layout_for_fiber(
+        &mut self,
+        window: &mut Window,
+        fiber_id: GlobalElementId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> usize {
+        self.compute_layout(window, Self::layout_id(&fiber_id), available_space, cx)
+    }
 
-        let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
-        let mut bounds = Bounds {
-            origin: point(
-                Pixels(layout.location.x / scale_factor),
-                Pixels(layout.location.y / scale_factor),
-            ),
-            size: size(
-                Pixels(layout.size.width / scale_factor),
-                Pixels(layout.size.height / scale_factor),
-            ),
-        };
-
-        if let Some(parent_id) = self.taffy.parent(id.0) {
-            let parent_bounds = self.layout_bounds(parent_id.into(), scale_factor);
-            bounds.origin += parent_bounds.origin;
-        }
-        self.absolute_layout_bounds.insert(id, bounds);
-
+    pub(crate) fn layout_bounds(
+        &mut self,
+        window: &mut Window,
+        layout_id: LayoutId,
+    ) -> Bounds<Pixels> {
+        let _ = self;
+        let scale_factor = window.scale_factor();
+        let mut cache = FxHashMap::default();
+        let fiber_id: GlobalElementId = layout_id.into();
+        let mut bounds = layout_bounds(window, &fiber_id, scale_factor, &mut cache);
+        bounds.origin += PrepaintCx::new(window).element_offset();
         bounds
     }
-}
 
-/// A unique identifier for a layout node, generated when requesting a layout from Taffy
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-#[repr(transparent)]
-pub struct LayoutId(NodeId);
+    pub(crate) fn layout_id(fiber_id: &GlobalElementId) -> LayoutId {
+        LayoutId::from(*fiber_id)
+    }
 
-impl LayoutId {
-    fn to_taffy_slice(node_ids: &[Self]) -> &[taffy::NodeId] {
-        // SAFETY: LayoutId is repr(transparent) to taffy::tree::NodeId.
-        unsafe { std::mem::transmute::<&[LayoutId], &[taffy::NodeId]>(node_ids) }
+    pub(crate) fn setup_taffy_from_fibers(
+        window: &mut Window,
+        root: GlobalElementId,
+        cx: &mut App,
+    ) {
+        // Set the setup_island_root so that fibers created during legacy element
+        // request_layout get assigned to the correct layout island.
+        window.fiber.setup_island_root = Some(root);
+        window.fiber.tree.rebuild_layout_islands_if_needed();
+        let rem_size = window.rem_size();
+        let scale_factor = window.scale_factor();
+
+        #[derive(Clone, Copy)]
+        struct LayoutStackState {
+            text_style_len: usize,
+            image_cache_len: usize,
+            rendered_entity_len: usize,
+        }
+
+        impl LayoutStackState {
+            fn capture(window: &Window) -> Self {
+                Self {
+                    text_style_len: window.text_style_stack.len(),
+                    image_cache_len: window.image_cache_stack.len(),
+                    rendered_entity_len: window.rendered_entity_stack.len(),
+                }
+            }
+
+            fn restore(self, window: &mut Window) {
+                window.text_style_stack.truncate(self.text_style_len);
+                window.image_cache_stack.truncate(self.image_cache_len);
+                window
+                    .rendered_entity_stack
+                    .truncate(self.rendered_entity_len);
+            }
+        }
+
+        struct LayoutStackFrame {
+            stack_state: LayoutStackState,
+            under_layout_change: bool,
+            node_frame: Option<crate::LayoutFrame>,
+        }
+        let mut frame_stack: Vec<LayoutStackFrame> = Vec::new();
+        let mut stack: Vec<(GlobalElementId, bool)> = vec![(root, true)];
+        let mut under_layout_change = false;
+
+        while let Some((fiber_id, entering)) = stack.pop() {
+            if entering {
+                let structure_epoch_before = window.fiber.tree.structure_epoch;
+                let (needs_layout, has_render_node) = match window.fiber.tree.get(&fiber_id) {
+                    Some(_fiber) => (
+                        window.fiber.tree.dirty_flags(&fiber_id).needs_layout(),
+                        window
+                            .fiber
+                            .tree
+                            .render_nodes
+                            .get(fiber_id.into())
+                            .is_some(),
+                    ),
+                    None => continue,
+                };
+                let mut skip_children = false;
+                let mut node_frame: Option<crate::LayoutFrame> = None;
+                let stack_state = LayoutStackState::capture(window);
+
+                let was_under_layout_change = under_layout_change;
+                if needs_layout {
+                    under_layout_change = true;
+                }
+                if under_layout_change {
+                    window.layout_engine.fibers_layout_changed.push(fiber_id);
+                }
+                if let Some(view_id) = window
+                    .fiber
+                    .tree
+                    .get(&fiber_id)
+                    .and_then(|fiber| window.fiber_view_id(&fiber_id, fiber))
+                {
+                    window.rendered_entity_stack.push(view_id);
+                }
+
+	                // Call layout_begin on render nodes (if they have one)
+	                let mut layout_handled = false;
+	                if has_render_node {
+	                    let _ = window.with_render_node_mut(fiber_id, |node, window| {
+	                        let mut ctx = crate::LayoutCtx {
+	                            fiber_id,
+	                            rem_size,
+	                            scale_factor,
+	                            window,
+	                            cx: &mut *cx,
+	                        };
+	                        let frame = node.layout_begin(&mut ctx);
+
+	                        // Track what the node pushed
+	                        layout_handled = frame.handled;
+
+	                        // If the node handled layout, update fiber's taffy_style from the node
+	                        if layout_handled && needs_layout {
+	                            let taffy_style = node.taffy_style(rem_size, scale_factor);
+	                            let _ = update_fiber_style(window, &fiber_id, taffy_style);
+	                            clear_fiber_measure_func(window, &fiber_id);
+	                        }
+
+	                        node_frame = Some(frame);
+	                    });
+	                }
+
+                // Layout for element types that don't have render nodes yet.
+                if !layout_handled && needs_layout {
+                    let _ = update_fiber_style(window, &fiber_id, taffy::Style::default());
+                    clear_fiber_measure_func(window, &fiber_id);
+                }
+
+                frame_stack.push(LayoutStackFrame {
+                    stack_state,
+                    under_layout_change: was_under_layout_change,
+                    node_frame,
+                });
+                stack.push((fiber_id, false));
+
+                if window.fiber.tree.structure_epoch != structure_epoch_before {
+                    window.fiber.tree.rebuild_layout_islands_if_needed();
+                }
+
+                if !skip_children {
+                    let children: SmallVec<[GlobalElementId; 8]> =
+                        window.fiber.tree.children(&fiber_id).collect();
+                    for child_id in children.into_iter().rev() {
+                        let child_island = window.fiber.tree.outer_island_root_for(child_id);
+                        if child_island == root {
+                            stack.push((child_id, true));
+                        }
+                    }
+                }
+	            } else if let Some(frame) = frame_stack.pop() {
+	                // Call layout_end on render nodes (if they had a node_frame)
+	                if let Some(node_frame) = frame.node_frame {
+	                    let _ = window.with_render_node_mut(fiber_id, |node, window| {
+	                        let mut ctx = crate::LayoutCtx {
+	                            fiber_id,
+	                            rem_size,
+	                            scale_factor,
+	                            window,
+	                            cx: &mut *cx,
+	                        };
+	                        node.layout_end(&mut ctx, node_frame);
+	                    });
+	                }
+
+                under_layout_change = frame.under_layout_change;
+                frame.stack_state.restore(window);
+            }
+        }
+
+        // Clear the setup_island_root now that setup is complete.
+        window.fiber.setup_island_root = None;
+    }
+
+    pub(crate) fn finalize_dirty_flags(window: &mut Window) {
+        if window.layout_engine.fibers_layout_changed.is_empty() {
+            return;
+        }
+
+        let scale_factor = window.scale_factor();
+        let mut cache = FxHashMap::default();
+        let mut changed_fibers: Vec<(GlobalElementId, crate::DirtyFlags)> = Vec::new();
+
+        for fiber_id in &window.layout_engine.fibers_layout_changed {
+            let new_bounds = layout_bounds(window, fiber_id, scale_factor, &mut cache);
+            let old_bounds = window.fiber.tree.bounds.get((*fiber_id).into()).copied();
+            let position_changed = old_bounds.map_or(true, |old| old.origin != new_bounds.origin);
+            let size_changed = old_bounds.map_or(true, |old| old.size != new_bounds.size);
+
+            window
+                .fiber
+                .tree
+                .bounds
+                .insert((*fiber_id).into(), new_bounds);
+
+            let mut flags = crate::DirtyFlags::NONE;
+            if position_changed || size_changed {
+                flags.insert(crate::DirtyFlags::NEEDS_PAINT);
+            }
+            if flags.any() {
+                changed_fibers.push((*fiber_id, flags));
+            }
+        }
+
+        for (fiber_id, flags) in changed_fibers {
+            window.fiber.tree.mark_dirty(&fiber_id, flags);
+        }
     }
 }
 
-impl std::hash::Hash for LayoutId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        u64::from(self.0).hash(state);
+pub(crate) fn layout_bounds(
+    window: &Window,
+    fiber_id: &GlobalElementId,
+    scale_factor: f32,
+    cache: &mut FxHashMap<GlobalElementId, Bounds<Pixels>>,
+) -> Bounds<Pixels> {
+    if let Some(bounds) = cache.get(fiber_id) {
+        return *bounds;
+    }
+
+    if let Some(child_id) = window.fiber.tree.view_wrapper_child(fiber_id) {
+        let bounds = layout_bounds(window, &child_id, scale_factor, cache);
+        cache.insert(*fiber_id, bounds);
+        return bounds;
+    }
+
+    let _fiber = window
+        .fiber
+        .tree
+        .get(fiber_id)
+        .unwrap_or_else(|| panic!("missing fiber {fiber_id:?}"));
+    window
+        .fiber
+        .tree
+        .layout_state
+        .get((*fiber_id).into())
+        .unwrap_or_else(|| panic!("missing layout state {fiber_id:?}"));
+    let final_layout = window.fiber.tree.final_layout_for_bounds(*fiber_id);
+    let mut bounds = Bounds {
+        origin: point(
+            Pixels(final_layout.location.x / scale_factor),
+            Pixels(final_layout.location.y / scale_factor),
+        ),
+        size: size(
+            Pixels(final_layout.size.width / scale_factor),
+            Pixels(final_layout.size.height / scale_factor),
+        ),
+    };
+
+    if let Some(parent_id) = window.fiber.tree.layout_parent(fiber_id) {
+        let parent_bounds = layout_bounds(window, &parent_id, scale_factor, cache);
+        bounds.origin += parent_bounds.origin;
+    }
+
+    cache.insert(*fiber_id, bounds);
+    bounds
+}
+
+fn update_fiber_style(
+    window: &mut Window,
+    fiber_id: &GlobalElementId,
+    new_style: taffy::Style,
+) -> bool {
+    let mut updated = false;
+    if let Some(layout_state) = window.fiber.tree.layout_state.get_mut((*fiber_id).into()) {
+        if layout_state.taffy_style != new_style {
+            layout_state.taffy_style = new_style;
+            window.fiber.tree.clear_taffy_cache_upwards(fiber_id);
+            updated = true;
+        }
+    }
+    updated
+}
+
+fn clear_fiber_measure_func(window: &mut Window, fiber_id: &GlobalElementId) {
+    if window
+        .fiber
+        .tree
+        .measure_funcs
+        .remove((*fiber_id).into())
+        .is_some()
+    {
+        window.fiber.tree.clear_taffy_cache_upwards(fiber_id);
     }
 }
 
-impl From<NodeId> for LayoutId {
-    fn from(node_id: NodeId) -> Self {
-        Self(node_id)
-    }
-}
-
-impl From<LayoutId> for NodeId {
-    fn from(layout_id: LayoutId) -> NodeId {
-        layout_id.0
-    }
-}
-
-trait ToTaffy<Output> {
+/// Trait for converting GPUI types to their taffy equivalents.
+pub trait ToTaffy<Output> {
+    /// Convert this type to its taffy equivalent, using the given rem size and scale factor.
     fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> Output;
 }
 

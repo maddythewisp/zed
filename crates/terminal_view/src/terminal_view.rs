@@ -10,7 +10,7 @@ use editor::{EditorSettings, actions::SelectAll, blink_manager::BlinkManager};
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, Pixels, Render,
-    ScrollWheelEvent, Styled, Subscription, Task, WeakEntity, actions, anchored, deferred, div,
+    ScrollWheelEvent, Styled, Subscription, Task, WeakEntity, actions, anchored, div,
 };
 use persistence::TERMINAL_DB;
 use project::{Project, search::SearchQuery};
@@ -1149,13 +1149,11 @@ impl Render for TerminalView {
                     }),
             )
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(gpui::Corner::TopLeft)
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
+                anchored()
+                    .position(*position)
+                    .anchor(gpui::Corner::TopLeft)
+                    .child(menu.clone())
+                    .z_index(1)
             }))
     }
 }

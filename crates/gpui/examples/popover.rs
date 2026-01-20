@@ -1,6 +1,6 @@
 use gpui::{
-    App, Application, Context, Corner, Div, Hsla, Stateful, Window, WindowOptions, anchored,
-    deferred, div, prelude::*, px,
+    App, Application, Context, Corner, Div, Hsla, Window, WindowOptions, anchored, div,
+    prelude::*, px,
 };
 
 /// An example show use deferred to create a floating layers.
@@ -9,7 +9,7 @@ struct HelloWorld {
     secondary_open: bool,
 }
 
-fn button(id: &'static str) -> Stateful<Div> {
+fn button(id: &'static str) -> Div {
     div()
         .id(id)
         .bg(gpui::black())
@@ -91,17 +91,15 @@ impl Render for HelloWorld {
                     .gap_4()
                     .child(
                         button("popover0").child("Opened Popover").child(
-                            deferred(
-                                anchored()
-                                    .anchor(Corner::TopLeft)
-                                    .snap_to_window_with_margin(px(8.))
-                                    .child(popover().w_96().gap_3().child(
-                                        "This is a default opened Popover, \
-                                        we can use deferred to render it \
-                                        in a floating layer.",
-                                    )),
-                            )
-                            .priority(0),
+                            anchored()
+                                .anchor(Corner::TopLeft)
+                                .snap_to_window_with_margin(px(8.))
+                                .child(popover().w_96().gap_3().child(
+                                    "This is a default opened Popover, \
+                                    we can use deferred to render it \
+                                    in a floating layer.",
+                                ))
+                                .z_index(0),
                         ),
                     )
                     .child(
@@ -113,36 +111,34 @@ impl Render for HelloWorld {
                             }))
                             .when(self.open, |this| {
                                 this.child(
-                                    deferred(
-                                        anchored()
-                                            .anchor(Corner::TopLeft)
-                                            .snap_to_window_with_margin(px(8.))
-                                            .child(
-                                                popover()
-                                                    .w_96()
-                                                    .gap_3()
-                                                    .child(
-                                                        "This is first level Popover, \
-                                                   we can use deferred to render it \
-                                                   in a floating layer.\n\
-                                                   Click outside to close.",
-                                                    )
-                                                    .when(!self.secondary_open, |this| {
-                                                        this.on_mouse_down_out(cx.listener(
-                                                            |this, _, _, cx| {
-                                                                this.open = false;
-                                                                cx.notify();
-                                                            },
-                                                        ))
-                                                    })
-                                                    // Here we need render popover after the content
-                                                    // to ensure it will be on top layer.
-                                                    .child(
-                                                        self.render_secondary_popover(window, cx),
-                                                    ),
-                                            ),
-                                    )
-                                    .priority(1),
+                                    anchored()
+                                        .anchor(Corner::TopLeft)
+                                        .snap_to_window_with_margin(px(8.))
+                                        .child(
+                                            popover()
+                                                .w_96()
+                                                .gap_3()
+                                                .child(
+                                                    "This is first level Popover, \
+                                               we can use deferred to render it \
+                                               in a floating layer.\n\
+                                               Click outside to close.",
+                                                )
+                                                .when(!self.secondary_open, |this| {
+                                                    this.on_mouse_down_out(cx.listener(
+                                                        |this, _, _, cx| {
+                                                            this.open = false;
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                })
+                                                // Here we need render popover after the content
+                                                // to ensure it will be on top layer.
+                                                .child(
+                                                    self.render_secondary_popover(window, cx),
+                                                ),
+                                        )
+                                        .z_index(1),
                                 )
                             }),
                     ),

@@ -1,7 +1,7 @@
 use gpui::{AnyElement, Hsla, Render};
 use story::Story;
 
-use ui::{prelude::*, utils::WithRemSize};
+use ui::prelude::*;
 
 pub struct WithRemSizeStory;
 
@@ -48,7 +48,7 @@ impl ParentElement for Example {
 
 impl RenderOnce for Example {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        WithRemSize::new(self.rem_size).child(
+        div().rem(self.rem_size).child(
             v_flex()
                 .gap_2()
                 .p_2()

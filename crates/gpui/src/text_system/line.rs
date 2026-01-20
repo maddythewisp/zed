@@ -1,7 +1,8 @@
+use crate::window::context::PaintCx;
 use crate::{
     App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, StrikethroughStyle,
-    TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px,
-    size,
+    TextAlign, TransformationMatrix, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout,
+    black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -69,6 +70,30 @@ impl ShapedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_with_transform(
+            origin,
+            line_height,
+            align,
+            align_width,
+            window,
+            cx,
+            TransformationMatrix::unit(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Paint the line of text to the window with an explicit visual transform.
+    pub fn paint_with_transform(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        transform: TransformationMatrix,
+    ) -> Result<()> {
         paint_line(
             origin,
             &self.layout,
@@ -79,9 +104,8 @@ impl ShapedLine {
             &[],
             window,
             cx,
-        )?;
-
-        Ok(())
+            transform,
+        )
     }
 
     /// Paint the background of the line to the window.
@@ -94,6 +118,30 @@ impl ShapedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_background_with_transform(
+            origin,
+            line_height,
+            align,
+            align_width,
+            window,
+            cx,
+            TransformationMatrix::unit(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Paint the background of the line to the window with an explicit visual transform.
+    pub fn paint_background_with_transform(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        transform: TransformationMatrix,
+    ) -> Result<()> {
         paint_line_background(
             origin,
             &self.layout,
@@ -104,9 +152,8 @@ impl ShapedLine {
             &[],
             window,
             cx,
-        )?;
-
-        Ok(())
+            transform,
+        )
     }
 }
 
@@ -138,6 +185,28 @@ impl WrappedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_with_transform(
+            origin,
+            line_height,
+            align,
+            bounds,
+            window,
+            cx,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paint this line of text with an explicit visual transform.
+    pub fn paint_with_transform(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+        transform: TransformationMatrix,
+    ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
             None => self.layout.wrap_width,
@@ -153,6 +222,7 @@ impl WrappedLine {
             &self.wrap_boundaries,
             window,
             cx,
+            transform,
         )?;
 
         Ok(())
@@ -167,6 +237,28 @@ impl WrappedLine {
         bounds: Option<Bounds<Pixels>>,
         window: &mut Window,
         cx: &mut App,
+    ) -> Result<()> {
+        self.paint_background_with_transform(
+            origin,
+            line_height,
+            align,
+            bounds,
+            window,
+            cx,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paint the background of line of text with an explicit visual transform.
+    pub fn paint_background_with_transform(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        window: &mut Window,
+        cx: &mut App,
+        transform: TransformationMatrix,
     ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
@@ -183,6 +275,7 @@ impl WrappedLine {
             &self.wrap_boundaries,
             window,
             cx,
+            transform,
         )?;
 
         Ok(())
@@ -199,15 +292,68 @@ fn paint_line(
     wrap_boundaries: &[WrapBoundary],
     window: &mut Window,
     cx: &mut App,
+    transform: TransformationMatrix,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
+    let local_bounds = Bounds::new(
         origin,
         size(
             layout.width,
             line_height * (wrap_boundaries.len() as f32 + 1.),
         ),
     );
-    window.paint_layer(line_bounds, |window| {
+    // When a visual transform is applied (e.g. from React Native view transforms),
+    // compute the transformed axis-aligned bounds so clipping/layering still occurs
+    // in window-space coordinates.
+    let layer_bounds = if transform.is_unit() {
+        local_bounds
+    } else {
+        // Transform the four corners and take their AABB.
+        let corners = [
+            local_bounds.origin,
+            point(
+                local_bounds.origin.x + local_bounds.size.width,
+                local_bounds.origin.y,
+            ),
+            point(
+                local_bounds.origin.x,
+                local_bounds.origin.y + local_bounds.size.height,
+            ),
+            point(
+                local_bounds.origin.x + local_bounds.size.width,
+                local_bounds.origin.y + local_bounds.size.height,
+            ),
+        ];
+
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+
+        for corner in corners {
+            let p = transform.apply(corner);
+            let x = f32::from(p.x);
+            let y = f32::from(p.y);
+            if x < min_x {
+                min_x = x;
+            }
+            if x > max_x {
+                max_x = x;
+            }
+            if y < min_y {
+                min_y = y;
+            }
+            if y > max_y {
+                max_y = y;
+            }
+        }
+
+        Bounds {
+            origin: point(px(min_x), px(min_y)),
+            size: size(px((max_x - min_x).max(0.0)), px((max_y - min_y).max(0.0))),
+        }
+    };
+
+    window.paint_layer(layer_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let mut decoration_runs = decoration_runs.iter();
@@ -246,10 +392,11 @@ fn paint_line(
                         if glyph_origin.x == underline_origin.x {
                             underline_origin.x -= max_glyph_size.width.half();
                         };
-                        window.paint_underline(
+                        window.paint_underline_with_transform(
                             *underline_origin,
                             glyph_origin.x - underline_origin.x,
                             underline_style,
+                            transform,
                         );
                         underline_origin.x = origin.x;
                         underline_origin.y += line_height;
@@ -260,10 +407,11 @@ fn paint_line(
                         if glyph_origin.x == strikethrough_origin.x {
                             strikethrough_origin.x -= max_glyph_size.width.half();
                         };
-                        window.paint_strikethrough(
+                        window.paint_strikethrough_with_transform(
                             *strikethrough_origin,
                             glyph_origin.x - strikethrough_origin.x,
                             strikethrough_style,
+                            transform,
                         );
                         strikethrough_origin.x = origin.x;
                         strikethrough_origin.y += line_height;
@@ -346,10 +494,11 @@ fn paint_line(
                     if underline_origin.x == glyph_origin.x {
                         underline_origin.x -= max_glyph_size.width.half();
                     };
-                    window.paint_underline(
+                    window.paint_underline_with_transform(
                         underline_origin,
                         glyph_origin.x - underline_origin.x,
                         &underline_style,
+                        transform,
                     );
                 }
 
@@ -359,10 +508,11 @@ fn paint_line(
                     if strikethrough_origin.x == glyph_origin.x {
                         strikethrough_origin.x -= max_glyph_size.width.half();
                     };
-                    window.paint_strikethrough(
+                    window.paint_strikethrough_with_transform(
                         strikethrough_origin,
                         glyph_origin.x - strikethrough_origin.x,
                         &strikethrough_style,
+                        transform,
                     );
                 }
 
@@ -371,23 +521,81 @@ fn paint_line(
                     size: max_glyph_size,
                 };
 
-                let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                let glyph_intersects_mask = if !window.should_cull_scene_primitives() {
+                    true
+                } else {
+                    let content_mask = PaintCx::new(window).content_mask();
+                    if transform.is_unit() {
+                        max_glyph_bounds.intersects(&content_mask.bounds)
+                    } else {
+                        // Transform glyph bounds into window space for correct masking when a
+                        // visual transform is applied.
+                        let corners = [
+                            max_glyph_bounds.origin,
+                            point(
+                                max_glyph_bounds.origin.x + max_glyph_bounds.size.width,
+                                max_glyph_bounds.origin.y,
+                            ),
+                            point(
+                                max_glyph_bounds.origin.x,
+                                max_glyph_bounds.origin.y + max_glyph_bounds.size.height,
+                            ),
+                            point(
+                                max_glyph_bounds.origin.x + max_glyph_bounds.size.width,
+                                max_glyph_bounds.origin.y + max_glyph_bounds.size.height,
+                            ),
+                        ];
+
+                        let mut min_x = f32::INFINITY;
+                        let mut max_x = f32::NEG_INFINITY;
+                        let mut min_y = f32::INFINITY;
+                        let mut max_y = f32::NEG_INFINITY;
+
+                        for corner in corners {
+                            let p = transform.apply(corner);
+                            let x = f32::from(p.x);
+                            let y = f32::from(p.y);
+                            if x < min_x {
+                                min_x = x;
+                            }
+                            if x > max_x {
+                                max_x = x;
+                            }
+                            if y < min_y {
+                                min_y = y;
+                            }
+                            if y > max_y {
+                                max_y = y;
+                            }
+                        }
+
+                        let world_bounds = Bounds {
+                            origin: point(px(min_x), px(min_y)),
+                            size: size(px((max_x - min_x).max(0.0)), px((max_y - min_y).max(0.0))),
+                        };
+
+                        world_bounds.intersects(&content_mask.bounds)
+                    }
+                };
+
+                if glyph_intersects_mask {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
-                        window.paint_emoji(
+                        window.paint_emoji_with_transform(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
+                            transform,
                         )?;
                     } else {
-                        window.paint_glyph(
+                        window.paint_glyph_with_transform(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                             color,
+                            transform,
                         )?;
                     }
                 }
@@ -405,10 +613,11 @@ fn paint_line(
             if last_line_end_x == underline_start.x {
                 underline_start.x -= max_glyph_size.width.half()
             };
-            window.paint_underline(
+            window.paint_underline_with_transform(
                 underline_start,
                 last_line_end_x - underline_start.x,
                 &underline_style,
+                transform,
             );
         }
 
@@ -416,10 +625,11 @@ fn paint_line(
             if last_line_end_x == strikethrough_start.x {
                 strikethrough_start.x -= max_glyph_size.width.half()
             };
-            window.paint_strikethrough(
+            window.paint_strikethrough_with_transform(
                 strikethrough_start,
                 last_line_end_x - strikethrough_start.x,
                 &strikethrough_style,
+                transform,
             );
         }
 
@@ -437,15 +647,64 @@ fn paint_line_background(
     wrap_boundaries: &[WrapBoundary],
     window: &mut Window,
     cx: &mut App,
+    transform: TransformationMatrix,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
+    let local_bounds = Bounds::new(
         origin,
         size(
             layout.width,
             line_height * (wrap_boundaries.len() as f32 + 1.),
         ),
     );
-    window.paint_layer(line_bounds, |window| {
+    let layer_bounds = if transform.is_unit() {
+        local_bounds
+    } else {
+        let corners = [
+            local_bounds.origin,
+            point(
+                local_bounds.origin.x + local_bounds.size.width,
+                local_bounds.origin.y,
+            ),
+            point(
+                local_bounds.origin.x,
+                local_bounds.origin.y + local_bounds.size.height,
+            ),
+            point(
+                local_bounds.origin.x + local_bounds.size.width,
+                local_bounds.origin.y + local_bounds.size.height,
+            ),
+        ];
+
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+
+        for corner in corners {
+            let p = transform.apply(corner);
+            let x = f32::from(p.x);
+            let y = f32::from(p.y);
+            if x < min_x {
+                min_x = x;
+            }
+            if x > max_x {
+                max_x = x;
+            }
+            if y < min_y {
+                min_y = y;
+            }
+            if y > max_y {
+                max_y = y;
+            }
+        }
+
+        Bounds {
+            origin: point(px(min_x), px(min_y)),
+            size: size(px((max_x - min_x).max(0.0)), px((max_y - min_y).max(0.0))),
+        }
+    };
+
+    window.paint_layer(layer_bounds, |window| {
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -477,13 +736,16 @@ fn paint_line_background(
                         if glyph_origin.x == background_origin.x {
                             background_origin.x -= max_glyph_size.width.half()
                         }
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: *background_origin,
-                                size: size(glyph_origin.x - background_origin.x, line_height),
-                            },
-                            *background_color,
-                        ));
+                        window.paint_quad_with_transform(
+                            fill(
+                                Bounds {
+                                    origin: *background_origin,
+                                    size: size(glyph_origin.x - background_origin.x, line_height),
+                                },
+                                *background_color,
+                            ),
+                            transform,
+                        );
                         background_origin.x = origin.x;
                         background_origin.y += line_height;
                     }
@@ -537,13 +799,16 @@ fn paint_line_background(
                     if background_origin.x == glyph_origin.x {
                         background_origin.x -= max_glyph_size.width.half();
                     };
-                    window.paint_quad(fill(
-                        Bounds {
-                            origin: background_origin,
-                            size: size(width, line_height),
-                        },
-                        background_color,
-                    ));
+                    window.paint_quad_with_transform(
+                        fill(
+                            Bounds {
+                                origin: background_origin,
+                                size: size(width, line_height),
+                            },
+                            background_color,
+                        ),
+                        transform,
+                    );
                 }
             }
         }
@@ -559,13 +824,16 @@ fn paint_line_background(
             if last_line_end_x == background_origin.x {
                 background_origin.x -= max_glyph_size.width.half()
             };
-            window.paint_quad(fill(
-                Bounds {
-                    origin: background_origin,
-                    size: size(last_line_end_x - background_origin.x, line_height),
-                },
-                background_color,
-            ));
+            window.paint_quad_with_transform(
+                fill(
+                    Bounds {
+                        origin: background_origin,
+                        size: size(last_line_end_x - background_origin.x, line_height),
+                    },
+                    background_color,
+                ),
+                transform,
+            );
         }
 
         Ok(())

@@ -13,7 +13,7 @@ use serde::Deserialize;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
 use ui::{
-    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
+    Divider, KeyBinding, ParentElement as _, Vector, VectorName,
     WithScrollbar as _, prelude::*, rems_from_px,
 };
 pub use workspace::welcome::ShowWelcome;

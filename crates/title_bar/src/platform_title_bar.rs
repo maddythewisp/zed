@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, Context, Decorations, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
+    ParentElement, Pixels, Styled, Window, WindowControlArea, div, px,
 };
 use smallvec::SmallVec;
 use std::mem;

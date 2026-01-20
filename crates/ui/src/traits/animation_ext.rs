@@ -14,7 +14,7 @@ pub trait CommonAnimationExt: AnimationExt {
     #[track_caller]
     fn with_rotate_animation(self, duration: u64) -> AnimationElement<Self>
     where
-        Self: Transformable + Sized,
+        Self: Transformable + Sized + gpui::IntoElement + 'static,
     {
         self.with_keyed_rotate_animation(
             ElementId::CodeLocation(*std::panic::Location::caller()),
@@ -29,7 +29,7 @@ pub trait CommonAnimationExt: AnimationExt {
         duration: u64,
     ) -> AnimationElement<Self>
     where
-        Self: Transformable + Sized,
+        Self: Transformable + Sized + gpui::IntoElement + 'static,
     {
         self.with_animation(
             id,

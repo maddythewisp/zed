@@ -17,8 +17,8 @@ use gpui::{
     DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
     InteractiveElement, IntoElement, KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior,
     MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollStrategy,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, point, px, size,
+    SharedString, Styled, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, div, point, px, size,
     uniform_list,
 };
 use itertools::Itertools;
@@ -2208,7 +2208,7 @@ impl OutlinePanel {
         depth: usize,
         window: &mut Window,
         cx: &mut Context<OutlinePanel>,
-    ) -> Option<Stateful<Div>> {
+    ) -> Option<Div> {
         let item_id = ElementId::from(excerpt.id.to_proto() as usize);
         let is_active = match self.selected_entry() {
             Some(PanelEntry::Outline(OutlineEntry::Excerpt(selected_excerpt))) => {
@@ -2277,7 +2277,7 @@ impl OutlinePanel {
         string_match: Option<&StringMatch>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let item_id = ElementId::from(SharedString::from(format!(
             "{:?}|{:?}{:?}|{:?}",
             outline.buffer_id, outline.excerpt_id, outline.outline.range, &outline.outline.text,
@@ -2345,7 +2345,7 @@ impl OutlinePanel {
         string_match: Option<&StringMatch>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let settings = OutlinePanelSettings::get_global(cx);
         let is_active = match self.selected_entry() {
             Some(PanelEntry::Fs(selected_entry)) => selected_entry == rendered_entry,
@@ -2462,7 +2462,7 @@ impl OutlinePanel {
         string_match: Option<&StringMatch>,
         window: &mut Window,
         cx: &mut Context<OutlinePanel>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let settings = OutlinePanelSettings::get_global(cx);
         let is_active = match self.selected_entry() {
             Some(PanelEntry::FoldedDirs(selected_dirs)) => {
@@ -2536,7 +2536,7 @@ impl OutlinePanel {
         string_match: Option<&StringMatch>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Stateful<Div>> {
+    ) -> Option<Div> {
         let search_data = match render_data.get() {
             Some(search_data) => search_data,
             None => {
@@ -2628,7 +2628,7 @@ impl OutlinePanel {
         label_element: gpui::AnyElement,
         window: &mut Window,
         cx: &mut Context<OutlinePanel>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let settings = OutlinePanelSettings::get_global(cx);
         div()
             .text_ui(cx)
@@ -4784,13 +4784,11 @@ impl OutlinePanel {
                 )
         }
         .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-            deferred(
-                anchored()
-                    .position(*position)
-                    .anchor(gpui::Corner::TopLeft)
-                    .child(menu.clone()),
-            )
-            .with_priority(1)
+            anchored()
+                .position(*position)
+                .anchor(gpui::Corner::TopLeft)
+                .child(menu.clone())
+                .z_index(1)
         }));
 
         v_flex().w_full().flex_1().overflow_hidden().child(contents)

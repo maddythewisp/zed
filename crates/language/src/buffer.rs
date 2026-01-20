@@ -30,7 +30,7 @@ use fs::MTime;
 use futures::channel::oneshot;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, HighlightStyle, SharedString, StyledText,
-    Task, TextStyle,
+    Task, TextElement, TextStyle,
 };
 
 use lsp::{LanguageServerId, NumberOrString};
@@ -669,7 +669,8 @@ impl HighlightedText {
     }
 
     pub fn to_styled_text(&self, default_style: &TextStyle) -> StyledText {
-        gpui::StyledText::new(self.text.clone())
+        self.text
+            .clone()
             .with_default_highlights(default_style, self.highlights.iter().cloned())
     }
 

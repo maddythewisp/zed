@@ -95,8 +95,7 @@ impl EntityMap {
     where
         T: 'static,
     {
-        let mut accessed_entities = self.accessed_entities.borrow_mut();
-        accessed_entities.insert(slot.entity_id);
+        self.record_access(slot.entity_id);
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -107,8 +106,7 @@ impl EntityMap {
     #[track_caller]
     pub fn lease<T>(&mut self, pointer: &Entity<T>) -> Lease<T> {
         self.assert_valid_context(pointer);
-        let mut accessed_entities = self.accessed_entities.borrow_mut();
-        accessed_entities.insert(pointer.entity_id);
+        self.record_access(pointer.entity_id);
 
         let entity = Some(
             self.entities
@@ -129,8 +127,7 @@ impl EntityMap {
 
     pub fn read<T: 'static>(&self, entity: &Entity<T>) -> &T {
         self.assert_valid_context(entity);
-        let mut accessed_entities = self.accessed_entities.borrow_mut();
-        accessed_entities.insert(entity.entity_id);
+        self.record_access(entity.entity_id);
 
         self.entities
             .get(entity.entity_id)
@@ -145,13 +142,20 @@ impl EntityMap {
         );
     }
 
-    pub fn extend_accessed(&mut self, entities: &FxHashSet<EntityId>) {
+    fn record_access(&self, entity_id: EntityId) {
+        self.accessed_entities.borrow_mut().insert(entity_id);
+    }
+
+    pub(crate) fn extend_accessed(&self, entities: &FxHashSet<EntityId>) {
+        if entities.is_empty() {
+            return;
+        }
         self.accessed_entities
             .borrow_mut()
             .extend(entities.iter().copied());
     }
 
-    pub fn clear_accessed(&mut self) {
+    pub(crate) fn clear_accessed(&mut self) {
         self.accessed_entities.borrow_mut().clear();
     }
 

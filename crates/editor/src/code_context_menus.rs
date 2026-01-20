@@ -2,7 +2,7 @@ use crate::scroll::ScrollAmount;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     AnyElement, Entity, Focusable, FontWeight, ListSizingBehavior, ScrollHandle, ScrollStrategy,
-    SharedString, Size, StrikethroughStyle, StyledText, Task, UniformListScrollHandle, div, px,
+    SharedString, Size, StrikethroughStyle, Task, TextElement, UniformListScrollHandle, div, px,
     uniform_list,
 };
 use itertools::Itertools;
@@ -904,8 +904,8 @@ impl CompletionsMenu {
                                 Some((clamped_start..clamped_end, (*highlight)))
                             })
                             .collect();
-                        let main_label = StyledText::new(main_text)
-                            .with_default_highlights(&style.text, main_highlights);
+                        let main_label =
+                            main_text.with_default_highlights(&style.text, main_highlights);
 
                         let suffix_text: String = full_text[filter_range.end..].to_string();
                         let suffix_highlights: Vec<_> = highlights
@@ -920,10 +920,7 @@ impl CompletionsMenu {
                             })
                             .collect();
                         let suffix_label = if !suffix_text.is_empty() {
-                            Some(
-                                StyledText::new(suffix_text)
-                                    .with_default_highlights(&style.text, suffix_highlights),
-                            )
+                            Some(suffix_text.with_default_highlights(&style.text, suffix_highlights))
                         } else {
                             None
                         };

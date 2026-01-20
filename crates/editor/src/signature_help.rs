@@ -2,7 +2,7 @@ use crate::actions::ShowSignatureHelp;
 use crate::hover_popover::open_markdown_url;
 use crate::{BufferOffset, Editor, EditorSettings, ToggleAutoSignatureHelp, hover_markdown_style};
 use gpui::{
-    App, Context, Entity, HighlightStyle, MouseButton, ScrollHandle, Size, StyledText, Task,
+    App, Context, Entity, HighlightStyle, MouseButton, ScrollHandle, Size, Task, TextElement,
     TextStyle, Window, combine_highlights,
 };
 use language::BufferSnapshot;
@@ -15,7 +15,7 @@ use theme::ThemeSettings;
 use ui::{
     ActiveTheme, AnyElement, ButtonCommon, ButtonStyle, Clickable, FluentBuilder, IconButton,
     IconButtonShape, IconName, IconSize, InteractiveElement, IntoElement, Label, LabelCommon,
-    LabelSize, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, StyledExt,
+    LabelSize, ParentElement, Pixels, SharedString, Styled, StyledExt,
     WithScrollbar, div, relative,
 };
 
@@ -359,12 +359,10 @@ impl SignatureHelpPopover {
                     .max_w(max_size.width)
                     .max_h(max_size.height)
                     .track_scroll(&self.scroll_handle)
-                    .child(
-                        StyledText::new(signature.label.clone()).with_default_highlights(
-                            &self.style,
-                            signature.highlights.iter().cloned(),
-                        ),
-                    )
+                    .child(signature.label.clone().with_default_highlights(
+                        &self.style,
+                        signature.highlights.iter().cloned(),
+                    ))
                     .when_some(
                         signature.parameter_documentation.clone(),
                         |this, param_doc| {

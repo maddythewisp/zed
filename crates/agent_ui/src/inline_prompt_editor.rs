@@ -25,7 +25,6 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use theme::ThemeSettings;
-use ui::utils::WithRemSize;
 use ui::{IconButtonShape, KeyBinding, PopoverMenuHandle, Tooltip, prelude::*};
 use uuid::Uuid;
 use workspace::notifications::NotificationId;
@@ -182,7 +181,8 @@ impl<T: 'static> Render for PromptEditor<T> {
                         });
                     }))
                     .child(
-                        WithRemSize::new(ui_font_size)
+                        div()
+                            .rem(ui_font_size)
                             .h_full()
                             .w(left_gutter_width)
                             .flex()
@@ -216,7 +216,8 @@ impl<T: 'static> Render for PromptEditor<T> {
                             .justify_between()
                             .child(div().flex_1().child(self.render_editor(window, cx)))
                             .child(
-                                WithRemSize::new(ui_font_size)
+                                div()
+                                    .rem(ui_font_size)
                                     .flex()
                                     .flex_row()
                                     .items_center()

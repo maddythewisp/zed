@@ -6,7 +6,7 @@ use git::repository::CommitSummary;
 use git::{GitRemote, commit::ParsedCommitMessage};
 use gpui::{
     App, Asset, Element, Entity, MouseButton, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, WeakEntity, prelude::*,
+    WeakEntity, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement};
 use project::git_store::Repository;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use editor::{Editor, EditorMode, MultiBuffer};
 use futures::future::Shared;
 use gpui::{
-    App, Entity, Hsla, RetainAllImageCache, Task, TextStyleRefinement, image_cache, prelude::*,
+    App, Entity, Hsla, RetainAllImageCache, Task, TextStyleRefinement, prelude::*,
 };
 use language::{Buffer, Language, LanguageRegistry};
 use markdown_preview::{markdown_parser::parse_markdown, markdown_renderer::render_markdown_block};

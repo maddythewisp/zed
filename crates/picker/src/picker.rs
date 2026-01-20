@@ -11,8 +11,8 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, Length, ListSizingBehavior, ListState, MouseButton, MouseUpEvent,
-    Pixels, Render, ScrollStrategy, Task, UniformListScrollHandle, Window, actions, canvas, div,
-    list, prelude::*, uniform_list,
+    Pixels, Render, ScrollStrategy, Task, UniformListScrollHandle, Window, actions, div, list,
+    prelude::*, uniform_list,
 };
 use head::Head;
 use schemars::JsonSchema;
@@ -23,7 +23,7 @@ use std::{
 use theme::ThemeSettings;
 use ui::{
     Color, Divider, DocumentationAside, DocumentationSide, Label, ListItem, ListItemSpacing,
-    ScrollAxes, Scrollbars, WithScrollbar, prelude::*, utils::WithRemSize, v_flex,
+    ScrollAxes, Scrollbars, WithScrollbar, prelude::*, v_flex,
 };
 use workspace::{ModalView, item::Settings};
 
@@ -770,18 +770,11 @@ impl<D: PickerDelegate> Picker<D> {
         div()
             .id(("item", ix))
             .cursor_pointer()
-            .child(
-                canvas(
-                    move |bounds, _window, _cx| {
-                        item_bounds.borrow_mut().insert(ix, bounds);
-                    },
-                    |_bounds, _state, _window, _cx| {},
-                )
-                .size_full()
-                .absolute()
-                .top_0()
-                .left_0(),
-            )
+            .child(div().size_full().absolute().top_0().left_0().on_layout(
+                move |bounds, _window, _cx| {
+                    item_bounds.borrow_mut().insert(ix, bounds);
+                },
+            ))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.handle_click(ix, event.modifiers().secondary(), window, cx)
             }))
@@ -882,18 +875,11 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .size_full()
             .when_some(self.width, |el, width| el.w(width))
             .overflow_hidden()
-            .child(
-                canvas(
-                    move |bounds, _window, _cx| {
-                        picker_bounds.set(Some(bounds));
-                    },
-                    |_bounds, _state, _window, _cx| {},
-                )
-                .size_full()
-                .absolute()
-                .top_0()
-                .left_0(),
-            )
+            .child(div().size_full().absolute().top_0().left_0().on_layout(
+                move |bounds, _window, _cx| {
+                    picker_bounds.set(Some(bounds));
+                },
+            ))
             // This is a bit of a hack to remove the modal styling when we're rendering the `Picker`
             // as a part of a modal rather than the entire modal.
             //
@@ -979,7 +965,8 @@ impl<D: PickerDelegate> Render for Picker<D> {
         };
 
         let render_aside = |aside: DocumentationAside, cx: &mut Context<Self>| {
-            WithRemSize::new(ui_font_size)
+            div()
+                .rem(ui_font_size)
                 .occlude()
                 .elevation_2(cx)
                 .w_full()

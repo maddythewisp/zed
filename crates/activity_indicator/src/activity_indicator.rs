@@ -4,7 +4,7 @@ use extension_host::{ExtensionOperation, ExtensionStore};
 use futures::StreamExt;
 use gpui::{
     App, Context, CursorStyle, Entity, EventEmitter, InteractiveElement as _, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, actions,
+    Render, SharedString, Styled, Window, actions,
 };
 use language::{
     BinaryStatus, LanguageRegistry, LanguageServerId, LanguageServerName,

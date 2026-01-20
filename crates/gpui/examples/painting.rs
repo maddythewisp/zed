@@ -372,11 +372,11 @@ impl Render for PaintingViewer {
                                 }
 
                                 // Then draw the default paths on top
-                                for (path, color) in default_lines {
-                                    window.paint_path(path, color);
+                                for (path, color) in default_lines.iter() {
+                                    window.paint_path(path.clone(), *color);
                                 }
 
-                                for points in lines {
+                                for points in lines.iter() {
                                     if points.len() < 2 {
                                         continue;
                                     }
@@ -385,7 +385,7 @@ impl Render for PaintingViewer {
                                     if dashed {
                                         builder = builder.dash_array(&[px(4.), px(2.)]);
                                     }
-                                    for (i, p) in points.into_iter().enumerate() {
+                                    for (i, p) in points.iter().copied().enumerate() {
                                         if i == 0 {
                                             builder.move_to(p);
                                         } else {

@@ -33,7 +33,7 @@ enum DividerDirection {
 }
 
 /// The color of a [`Divider`].
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub enum DividerColor {
     Border,
     BorderFaded,

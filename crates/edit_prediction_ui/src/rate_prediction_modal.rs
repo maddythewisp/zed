@@ -474,7 +474,7 @@ impl RatePredictionsModal {
             )
     }
 
-    fn render_suggested_edits(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+    fn render_suggested_edits(&self, cx: &mut Context<Self>) -> Option<Div> {
         let bg_color = cx.theme().colors().editor_background;
         Some(
             div()
@@ -492,7 +492,7 @@ impl RatePredictionsModal {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::Stateful<Div>> {
+    ) -> Option<Div> {
         let theme_settings = ThemeSettings::get_global(cx);
         let buffer_font_size = theme_settings.buffer_font_size(cx);
 

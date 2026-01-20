@@ -161,21 +161,66 @@ struct TransformationMatrix {
     translation: vec2<f32>,
 }
 
+fn apply_transform(position: vec2<f32>, transform: TransformationMatrix) -> vec2<f32> {
+    // Rust stores rotation_scale row-major; transpose for WGSL multiplication
+    return transpose(transform.rotation_scale) * position + transform.translation;
+}
+
+struct GpuTransform {
+    offset: vec2<f32>,
+    scale: f32,
+    parent_index: u32,
+}
+
+struct ResolvedTransform {
+    offset: vec2<f32>,
+    scale: f32,
+}
+
+var<storage, read> b_context_transforms: array<GpuTransform>;
+
+fn resolve_transform(transform_index: u32) -> ResolvedTransform {
+    var out: ResolvedTransform;
+    out.offset = vec2<f32>(0.0);
+    out.scale = 1.0;
+
+    var current = transform_index;
+    for (var i = 0u; i < 16u && current != 0u; i = i + 1u) {
+        let t = b_context_transforms[current];
+        out.offset = out.offset * t.scale + t.offset;
+        out.scale = out.scale * t.scale;
+        current = t.parent_index;
+    }
+
+    return out;
+}
+
+fn apply_context_transform(position: vec2<f32>, transform_index: u32) -> vec2<f32> {
+    let t = resolve_transform(transform_index);
+    return position * t.scale + t.offset;
+}
+
+fn apply_context_transform_inverse(position: vec2<f32>, transform_index: u32) -> vec2<f32> {
+    let t = resolve_transform(transform_index);
+    return (position - t.offset) / t.scale;
+}
+
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
 }
 
-fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec4<f32> {
+fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds, transform_index: u32) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
-    return to_device_position_impl(position);
+    let world_position = apply_context_transform(position, transform_index);
+    return to_device_position_impl(world_position);
 }
 
-fn to_device_position_transformed(unit_vertex: vec2<f32>, bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
+fn to_device_position_transformed(unit_vertex: vec2<f32>, bounds: Bounds, transform: TransformationMatrix, transform_index: u32) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
-    //Note: Rust side stores it as row-major, so transposing here
-    let transformed = transpose(transform.rotation_scale) * position + transform.translation;
-    return to_device_position_impl(transformed);
+    let transformed = apply_transform(position, transform);
+    let world_position = apply_context_transform(transformed, transform_index);
+    return to_device_position_impl(world_position);
 }
 
 fn to_tile_position(unit_vertex: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
@@ -194,10 +239,17 @@ fn distance_from_clip_rect(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: 
     return distance_from_clip_rect_impl(position, clip_bounds);
 }
 
-fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
+fn distance_from_clip_rect_with_context(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform_index: u32) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
-    let transformed = transpose(transform.rotation_scale) * position + transform.translation;
-    return distance_from_clip_rect_impl(transformed, clip_bounds);
+    let world_position = apply_context_transform(position, transform_index);
+    return distance_from_clip_rect_impl(world_position, clip_bounds);
+}
+
+fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform: TransformationMatrix, transform_index: u32) -> vec4<f32> {
+    let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
+    let transformed = apply_transform(position, transform);
+    let world_position = apply_context_transform(transformed, transform_index);
+    return distance_from_clip_rect_impl(world_position, clip_bounds);
 }
 
 // https://gamedev.stackexchange.com/questions/92015/optimized-linear-to-srgb-glsl
@@ -500,6 +552,8 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 struct Quad {
     order: u32,
     border_style: u32,
+    transform_index: u32,
+    pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
     background: Background,
@@ -508,6 +562,7 @@ struct Quad {
     border_widths: Edges,
 }
 var<storage, read> b_quads: array<Quad>;
+var<storage, read> b_quad_transforms: array<TransformationMatrix>;
 
 struct QuadVarying {
     @builtin(position) position: vec4<f32>,
@@ -524,9 +579,10 @@ struct QuadVarying {
 fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> QuadVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let quad = b_quads[instance_id];
+    let transform = b_quad_transforms[instance_id];
 
     var out = QuadVarying();
-    out.position = to_device_position(unit_vertex, quad.bounds);
+    out.position = to_device_position_transformed(unit_vertex, quad.bounds, transform, quad.transform_index);
 
     let gradient = prepare_gradient_color(
         quad.background.tag,
@@ -539,8 +595,20 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color1 = gradient.color1;
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, quad.bounds, quad.content_mask, transform, quad.transform_index);
     return out;
+}
+
+// Helpers to map device-space to the quad's local coordinate space
+fn invert2x2(m: mat2x2<f32>) -> mat2x2<f32> {
+    let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    return (1.0 / det) * mat2x2<f32>(m[1][1], -m[0][1], -m[1][0], m[0][0]);
+}
+
+fn to_local_position(world: vec2<f32>, t: TransformationMatrix) -> vec2<f32> {
+    let m = transpose(t.rotation_scale);
+    let inv = invert2x2(m);
+    return inv * (world - t.translation);
 }
 
 @fragment
@@ -551,8 +619,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     }
 
     let quad = b_quads[input.quad_id];
-
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    let transform = b_quad_transforms[input.quad_id];
+    let visual_world = apply_context_transform_inverse(input.position.xy, quad.transform_index);
+    let local_position = to_local_position(visual_world, transform);
+    let background_color = gradient_color(quad.background, local_position, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -571,7 +641,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let size = quad.bounds.size;
     let half_size = size / 2.0;
-    let point = input.position.xy - quad.bounds.origin;
+    let point = local_position - quad.bounds.origin;
     let center_to_point = point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -932,12 +1002,15 @@ fn fmod(a: f32, b: f32) -> f32 {
 struct Shadow {
     order: u32,
     blur_radius: f32,
+    transform_index: u32,
+    pad: u32,
     bounds: Bounds,
     corner_radii: Corners,
     content_mask: Bounds,
     color: Hsla,
 }
 var<storage, read> b_shadows: array<Shadow>;
+var<storage, read> b_shadow_transforms: array<TransformationMatrix>;
 
 struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
@@ -951,6 +1024,7 @@ struct ShadowVarying {
 fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ShadowVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     var shadow = b_shadows[instance_id];
+    let transform = b_shadow_transforms[instance_id];
 
     let margin = 3.0 * shadow.blur_radius;
     // Set the bounds of the shadow and adjust its size based on the shadow's
@@ -959,10 +1033,10 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     shadow.bounds.size += 2.0 * vec2<f32>(margin);
 
     var out = ShadowVarying();
-    out.position = to_device_position(unit_vertex, shadow.bounds);
+    out.position = to_device_position_transformed(unit_vertex, shadow.bounds, transform, shadow.transform_index);
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, shadow.bounds, shadow.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, shadow.bounds, shadow.content_mask, transform, shadow.transform_index);
     return out;
 }
 
@@ -974,9 +1048,12 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     }
 
     let shadow = b_shadows[input.shadow_id];
+    let transform = b_shadow_transforms[input.shadow_id];
+    let visual_world = apply_context_transform_inverse(input.position.xy, shadow.transform_index);
+    let local_position = to_local_position(visual_world, transform);
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
-    let center_to_point = input.position.xy - center;
+    let center_to_point = local_position - center;
 
     let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
 
@@ -1007,6 +1084,7 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    transform_index: u32,
 }
 
 var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
@@ -1022,12 +1100,13 @@ struct PathRasterizationVarying {
 @vertex
 fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasterizationVarying {
     let v = b_path_vertices[vertex_id];
+    let world_position = apply_context_transform(v.xy_position, v.transform_index);
 
     var out = PathRasterizationVarying();
-    out.position = to_device_position_impl(v.xy_position);
+    out.position = to_device_position_impl(world_position);
     out.st_position = v.st_position;
     out.vertex_id = vertex_id;
-    out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
+    out.clip_distances = distance_from_clip_rect_impl(world_position, v.bounds);
     return out;
 }
 
@@ -1081,7 +1160,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let sprite = b_path_sprites[instance_id];
     // Don't apply content mask because it was already accounted for when rasterizing the path.
-    let device_position = to_device_position(unit_vertex, sprite.bounds);
+    let device_position = to_device_position(unit_vertex, sprite.bounds, 0u);
     // For screen-space intermediate texture, convert screen position to texture coordinates
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
     let texture_coords = screen_position / globals.viewport_size;
@@ -1103,7 +1182,7 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
 
 struct Underline {
     order: u32,
-    pad: u32,
+    transform_index: u32,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
@@ -1111,6 +1190,7 @@ struct Underline {
     wavy: u32,
 }
 var<storage, read> b_underlines: array<Underline>;
+var<storage, read> b_underline_transforms: array<TransformationMatrix>;
 
 struct UnderlineVarying {
     @builtin(position) position: vec4<f32>,
@@ -1124,12 +1204,13 @@ struct UnderlineVarying {
 fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> UnderlineVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let underline = b_underlines[instance_id];
+    let transform = b_underline_transforms[instance_id];
 
     var out = UnderlineVarying();
-    out.position = to_device_position(unit_vertex, underline.bounds);
+    out.position = to_device_position_transformed(unit_vertex, underline.bounds, transform, underline.transform_index);
     out.color = hsla_to_rgba(underline.color);
     out.underline_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, underline.bounds, underline.content_mask, transform, underline.transform_index);
     return out;
 }
 
@@ -1144,6 +1225,9 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     }
 
     let underline = b_underlines[input.underline_id];
+    let transform = b_underline_transforms[input.underline_id];
+    let visual_world = apply_context_transform_inverse(input.position.xy, underline.transform_index);
+    let local_position = to_local_position(visual_world, transform);
     if ((underline.wavy & 0xFFu) == 0u)
     {
         return blend_color(input.color, input.color.a);
@@ -1151,7 +1235,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
     let half_thickness = underline.thickness * 0.5;
 
-    let st = (input.position.xy - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
+    let st = (local_position - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
     let frequency = M_PI_F * WAVE_FREQUENCY * underline.thickness / underline.bounds.size.y;
     let amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
 
@@ -1169,7 +1253,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
 struct MonochromeSprite {
     order: u32,
-    pad: u32,
+    transform_index: u32,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
@@ -1191,11 +1275,11 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = b_mono_sprites[instance_id];
 
     var out = MonoSpriteVarying();
-    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, sprite.transform_index);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation, sprite.transform_index);
     return out;
 }
 
@@ -1216,7 +1300,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    transform_index: u32,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
@@ -1225,6 +1309,7 @@ struct PolychromeSprite {
     tile: AtlasTile,
 }
 var<storage, read> b_poly_sprites: array<PolychromeSprite>;
+var<storage, read> b_poly_sprite_transforms: array<TransformationMatrix>;
 
 struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
@@ -1237,12 +1322,13 @@ struct PolySpriteVarying {
 fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PolySpriteVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let sprite = b_poly_sprites[instance_id];
+    let transform = b_poly_sprite_transforms[instance_id];
 
     var out = PolySpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, transform, sprite.transform_index);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, transform, sprite.transform_index);
     return out;
 }
 
@@ -1255,7 +1341,10 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     let sprite = b_poly_sprites[input.sprite_id];
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let transform = b_poly_sprite_transforms[input.sprite_id];
+    let visual_world = apply_context_transform_inverse(input.position.xy, sprite.transform_index);
+    let local_position = to_local_position(visual_world, transform);
+    let distance = quad_sdf(local_position, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
     if ((sprite.grayscale & 0xFFu) != 0u) {
@@ -1270,6 +1359,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    transform_index: u32,
+    pad: u32,
 }
 
 var<uniform> surface_locals: SurfaceParams;
@@ -1295,9 +1386,9 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
 
     var out = SurfaceVarying();
-    out.position = to_device_position(unit_vertex, surface_locals.bounds);
+    out.position = to_device_position(unit_vertex, surface_locals.bounds, surface_locals.transform_index);
     out.texture_position = unit_vertex;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    out.clip_distances = distance_from_clip_rect_with_context(unit_vertex, surface_locals.bounds, surface_locals.content_mask, surface_locals.transform_index);
     return out;
 }
 
@@ -1320,7 +1411,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
 struct SubpixelSprite {
     order: u32,
-    pad: u32,
+    transform_index: u32,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
@@ -1347,10 +1438,10 @@ fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     let sprite = b_subpixel_sprites[instance_id];
 
     var out = SubpixelSpriteOutput();
-    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, sprite.transform_index);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation, sprite.transform_index);
     return out;
 }
 

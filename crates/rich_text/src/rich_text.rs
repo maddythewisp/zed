@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use gpui::{
-    AnyElement, AnyView, App, ElementId, FontStyle, FontWeight, HighlightStyle, InteractiveText,
-    IntoElement, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
+    AnyElement, AnyView, App, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString,
+    StrikethroughStyle, TextElement, UnderlineStyle, Window,
 };
 use language::{HighlightId, Language, LanguageRegistry};
 use std::{ops::Range, sync::Arc};
@@ -90,13 +90,13 @@ impl RichText {
         self.custom_ranges_tooltip_fn = Some(Arc::new(f));
     }
 
-    pub fn element(&self, id: ElementId, window: &mut Window, cx: &mut App) -> AnyElement {
+    pub fn element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         let theme = cx.theme();
         let code_background = theme.colors().surface_background;
 
-        InteractiveText::new(
-            id,
-            StyledText::new(self.text.clone()).with_default_highlights(
+        self.text
+            .clone()
+            .with_default_highlights(
                 &window.text_style(),
                 self.highlights.iter().map(|(range, highlight)| {
                     (
@@ -139,9 +139,8 @@ impl RichText {
                         },
                     )
                 }),
-            ),
-        )
-        .on_click(self.link_ranges.clone(), {
+            )
+            .on_click(self.link_ranges.clone(), {
             let link_urls = self.link_urls.clone();
             move |ix, _, cx| {
                 let url = &link_urls[ix];

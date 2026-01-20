@@ -23,8 +23,8 @@ use gpui::{
     DismissEvent, Div, DragMoveEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
     Hsla, InteractiveElement, KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
+    PromptLevel, Render, ScrollStrategy, Styled, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, div, hsla,
     linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
 };
 use language::DiagnosticSeverity;
@@ -4710,7 +4710,7 @@ impl ProjectPanel {
         details: EntryDetails,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         const GROUP_NAME: &str = "project_entry";
 
         let kind = details.kind;
@@ -5297,7 +5297,7 @@ impl ProjectPanel {
                     .overflow_x(),
             )
             .when_some(validation_color_and_message, |this, (color, message)| {
-                this.relative().child(deferred(
+                this.relative().child(
                     div()
                         .occlude()
                         .absolute()
@@ -5313,8 +5313,9 @@ impl ProjectPanel {
                             Label::new(message)
                                 .color(Color::from(color))
                                 .size(LabelSize::Small),
-                        ),
-                ))
+                        )
+                        .z_index(0),
+                )
             })
     }
 
@@ -6421,13 +6422,11 @@ impl Render for ProjectPanel {
                     cx,
                 )
                 .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                    deferred(
-                        anchored()
-                            .position(*position)
-                            .anchor(gpui::Corner::TopLeft)
-                            .child(menu.clone()),
-                    )
-                    .with_priority(3)
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Corner::TopLeft)
+                        .child(menu.clone())
+                        .z_index(3)
                 }))
         } else {
             let focus_handle = self.focus_handle(cx);

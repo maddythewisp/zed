@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use gpui::{AnyElement, IntoElement, Stateful};
+use gpui::{AnyElement, IntoElement};
 use smallvec::SmallVec;
 
 use crate::prelude::*;
@@ -31,7 +31,7 @@ pub enum TabCloseSide {
 
 #[derive(IntoElement, RegisterComponent)]
 pub struct Tab {
-    div: Stateful<Div>,
+    div: Div,
     selected: bool,
     position: TabPosition,
     close_side: TabCloseSide,
@@ -91,7 +91,6 @@ impl InteractiveElement for Tab {
     }
 }
 
-impl StatefulInteractiveElement for Tab {}
 
 impl Toggleable for Tab {
     fn toggle_state(mut self, selected: bool) -> Self {
@@ -108,7 +107,7 @@ impl ParentElement for Tab {
 
 impl RenderOnce for Tab {
     #[allow(refining_impl_trait)]
-    fn render(self, _: &mut Window, cx: &mut App) -> Stateful<Div> {
+    fn render(self, _: &mut Window, cx: &mut App) -> Div {
         let (text_color, tab_bg, _tab_hover_bg, _tab_active_bg) = match self.selected {
             false => (
                 cx.theme().colors().text_muted,

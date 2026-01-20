@@ -1,9 +1,10 @@
-use std::{ops::Range, rc::Rc};
+use std::{any::TypeId, ops::Range, rc::Rc};
 
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Render, Style, UniformListDecoration,
-    Window, point, px, size,
+    AnyElement, App, Bounds, Context, Element, Entity, ElementImpl, IntoElement,
+    IntrinsicSizeResult, LayoutCtx, LayoutFrame, PaintCtx, PaintFrame, Pixels, Point, Position,
+    PrepaintCtx, PrepaintFrame, Render, RenderNode, SizingCtx, Style, TaffyStyle, ToTaffy,
+    UniformListDecoration, UpdateResult, Window, point, relative, size,
 };
 use smallvec::SmallVec;
 
@@ -59,11 +60,9 @@ where
     }
 }
 
+#[derive(Element)]
 struct StickyItemsElement {
-    drifting_element: Option<AnyElement>,
-    drifting_decoration: Option<AnyElement>,
-    rest_elements: SmallVec<[AnyElement; 8]>,
-    rest_decorations: SmallVec<[AnyElement; 1]>,
+    children: SmallVec<[AnyElement; 16]>,
 }
 
 impl IntoElement for StickyItemsElement {
@@ -74,62 +73,78 @@ impl IntoElement for StickyItemsElement {
     }
 }
 
-impl Element for StickyItemsElement {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
+impl ElementImpl for StickyItemsElement {
+    fn children(&self) -> &[AnyElement] {
+        &self.children
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
+    fn children_mut(&mut self) -> &mut [AnyElement] {
+        &mut self.children
     }
 
-    fn request_layout(
+    fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+        Some(Box::new(StickyItemsNode))
+    }
+
+    fn render_node_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<StickyItemsNode>())
+    }
+
+    fn update_render_node(
         &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        (window.request_layout(Style::default(), [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        _node: &mut dyn RenderNode,
         _window: &mut Window,
         _cx: &mut App,
-    ) -> Self::PrepaintState {
+    ) -> Option<UpdateResult> {
+        Some(UpdateResult::UNCHANGED)
+    }
+}
+
+struct StickyItemsNode;
+
+impl RenderNode for StickyItemsNode {
+    fn taffy_style(&self, rem_size: Pixels, scale_factor: f32) -> TaffyStyle {
+        let style = Style {
+            position: Position::Relative,
+            size: size(relative(1.).into(), relative(1.).into()),
+            ..Style::default()
+        };
+        style.to_taffy(rem_size, scale_factor)
     }
 
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        if let Some(ref mut drifting_element) = self.drifting_element {
-            drifting_element.paint(window, cx);
-        }
-        if let Some(ref mut drifting_decoration) = self.drifting_decoration {
-            drifting_decoration.paint(window, cx);
-        }
-        for item in self.rest_elements.iter_mut().rev() {
-            item.paint(window, cx);
-        }
-        for item in self.rest_decorations.iter_mut() {
-            item.paint(window, cx);
+    fn compute_intrinsic_size(&mut self, _ctx: &mut SizingCtx) -> IntrinsicSizeResult {
+        IntrinsicSizeResult {
+            size: gpui::IntrinsicSize::default(),
+            input: gpui::SizingInput::default(),
         }
     }
+
+    fn layout_begin(&mut self, _ctx: &mut LayoutCtx) -> LayoutFrame {
+        LayoutFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn layout_end(&mut self, _ctx: &mut LayoutCtx, _frame: LayoutFrame) {}
+
+    fn prepaint_begin(&mut self, _ctx: &mut PrepaintCtx) -> PrepaintFrame {
+        PrepaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepaint_end(&mut self, _ctx: &mut PrepaintCtx, _frame: PrepaintFrame) {}
+
+    fn paint_begin(&mut self, _ctx: &mut PaintCtx) -> PaintFrame {
+        PaintFrame {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    fn paint_end(&mut self, _ctx: &mut PaintCtx, _frame: PaintFrame) {}
 }
 
 impl<T> UniformListDecoration for StickyItems<T>
@@ -146,14 +161,13 @@ where
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        use crate::prelude::*;
+
         let entries = (self.compute_fn)(visible_range.clone(), window, cx);
 
         let Some(sticky_anchor) = find_sticky_anchor(&entries, visible_range.start) else {
             return StickyItemsElement {
-                drifting_element: None,
-                drifting_decoration: None,
-                rest_elements: SmallVec::new(),
-                rest_decorations: SmallVec::new(),
+                children: SmallVec::new(),
             }
             .into_any_element();
         };
@@ -166,15 +180,7 @@ where
             .map(|ix| anchor_depth.saturating_sub(items_count.saturating_sub(ix)))
             .collect();
 
-        let mut last_decoration_element = None;
-        let mut rest_decoration_elements = SmallVec::new();
-
         let expanded_width = bounds.size.width + scroll_offset.x.abs();
-
-        let decor_available_space = size(
-            AvailableSpace::Definite(expanded_width),
-            AvailableSpace::Definite(bounds.size.height),
-        );
 
         let drifting_y_offset = if sticky_anchor.drifting {
             let scroll_top = -scroll_offset.y;
@@ -193,33 +199,55 @@ where
             (None, indents)
         };
 
-        let base_origin = bounds.origin - point(px(0.), scroll_offset.y);
+        // Base y-offset for positioning children relative to StickyItemsElement
+        let base_y = -scroll_offset.y;
 
+        let mut children: SmallVec<[AnyElement; 16]> = SmallVec::new();
+
+        // Add rest element children (order matters for hitbox priority)
+        let (mut drifting_element, rest_elements) =
+            if sticky_anchor.drifting && !elements.is_empty() {
+                let last = elements.pop().expect("elements is not empty");
+                (Some(last), elements)
+            } else {
+                (None, elements)
+            };
+
+        for (ix, element) in rest_elements.into_iter().enumerate() {
+            let top = base_y + item_height * ix;
+            let wrapper = div()
+                .absolute()
+                .top(top)
+                .left(px(0.))
+                .w(expanded_width)
+                .h(item_height)
+                .child(element);
+            children.push(wrapper.into_any_element());
+        }
+
+        // Add drifting element (painted after rest so it appears on top)
+        if let Some(drifting_element) = drifting_element.take() {
+            let rest_count = children.len();
+            let top = base_y + item_height * rest_count + drifting_y_offset;
+            let wrapper = div()
+                .absolute()
+                .top(top)
+                .left(px(0.))
+                .w(expanded_width)
+                .h(item_height)
+                .child(drifting_element);
+            children.push(wrapper.into_any_element());
+        }
+
+        // Add decoration children
         for decoration in &self.decorations {
-            if let Some(drifting_indent) = drifting_indent {
-                let drifting_indent_vec: SmallVec<[usize; 8]> =
-                    [drifting_indent].into_iter().collect();
-
-                let sticky_origin = base_origin
-                    + point(px(0.), item_height * rest_indents.len() + drifting_y_offset);
-                let decoration_bounds = Bounds::new(sticky_origin, bounds.size);
-
-                let mut drifting_dec = decoration.as_ref().compute(
-                    &drifting_indent_vec,
-                    decoration_bounds,
-                    scroll_offset,
-                    item_height,
-                    window,
-                    cx,
-                );
-                drifting_dec.layout_as_root(decor_available_space, window, cx);
-                drifting_dec.prepaint_at(sticky_origin, window, cx);
-                last_decoration_element = Some(drifting_dec);
-            }
-
+            // Rest decorations (painted first, so they appear behind elements)
             if !rest_indents.is_empty() {
-                let decoration_bounds = Bounds::new(base_origin, bounds.size);
-                let mut rest_dec = decoration.as_ref().compute(
+                let decoration_bounds = Bounds::new(
+                    bounds.origin + point(px(0.), base_y),
+                    bounds.size,
+                );
+                let rest_dec = decoration.as_ref().compute(
                     &rest_indents,
                     decoration_bounds,
                     scroll_offset,
@@ -227,52 +255,47 @@ where
                     window,
                     cx,
                 );
-                rest_dec.layout_as_root(decor_available_space, window, cx);
-                rest_dec.prepaint_at(bounds.origin, window, cx);
-                rest_decoration_elements.push(rest_dec);
+                let wrapper = div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .w(expanded_width)
+                    .h(bounds.size.height)
+                    .child(rest_dec);
+                children.insert(0, wrapper.into_any_element());
+            }
+
+            // Drifting decoration
+            if let Some(drifting_indent) = drifting_indent {
+                let drifting_indent_vec: SmallVec<[usize; 8]> =
+                    [drifting_indent].into_iter().collect();
+
+                let drifting_top = base_y + item_height * rest_indents.len() + drifting_y_offset;
+                let decoration_bounds = Bounds::new(
+                    bounds.origin + point(px(0.), drifting_top),
+                    bounds.size,
+                );
+
+                let drifting_dec = decoration.as_ref().compute(
+                    &drifting_indent_vec,
+                    decoration_bounds,
+                    scroll_offset,
+                    item_height,
+                    window,
+                    cx,
+                );
+                let wrapper = div()
+                    .absolute()
+                    .top(drifting_top)
+                    .left(px(0.))
+                    .w(expanded_width)
+                    .h(bounds.size.height)
+                    .child(drifting_dec);
+                children.push(wrapper.into_any_element());
             }
         }
 
-        let (mut drifting_element, mut rest_elements) =
-            if sticky_anchor.drifting && !elements.is_empty() {
-                let last = elements.pop().unwrap();
-                (Some(last), elements)
-            } else {
-                (None, elements)
-            };
-
-        let element_available_space = size(
-            AvailableSpace::Definite(expanded_width),
-            AvailableSpace::Definite(item_height),
-        );
-
-        // order of prepaint is important here
-        // mouse events checks hitboxes in reverse insertion order
-        if let Some(ref mut drifting_element) = drifting_element {
-            let sticky_origin = base_origin
-                + point(
-                    px(0.),
-                    item_height * rest_elements.len() + drifting_y_offset,
-                );
-
-            drifting_element.layout_as_root(element_available_space, window, cx);
-            drifting_element.prepaint_at(sticky_origin, window, cx);
-        }
-
-        for (ix, element) in rest_elements.iter_mut().enumerate() {
-            let sticky_origin = base_origin + point(px(0.), item_height * ix);
-
-            element.layout_as_root(element_available_space, window, cx);
-            element.prepaint_at(sticky_origin, window, cx);
-        }
-
-        StickyItemsElement {
-            drifting_element,
-            drifting_decoration: last_decoration_element,
-            rest_elements,
-            rest_decorations: rest_decoration_elements,
-        }
-        .into_any_element()
+        StickyItemsElement { children }.into_any_element()
     }
 }
 

@@ -1,5 +1,6 @@
 mod derive_action;
 mod derive_app_context;
+mod derive_fiber_element;
 mod derive_into_element;
 mod derive_render;
 mod derive_visual_context;
@@ -32,6 +33,84 @@ pub fn register_action(ident: TokenStream) -> TokenStream {
 #[proc_macro_derive(IntoElement)]
 pub fn derive_into_element(input: TokenStream) -> TokenStream {
     derive_into_element::derive_into_element(input)
+}
+
+/// `#[derive(Element)]` generates the boilerplate `Element` trait implementation
+/// for fiber-native elements.
+///
+/// Fiber-native elements use `RenderNode` for retained rendering instead of the legacy
+/// `request_layout`/`prepaint`/`paint` methods. This derive macro generates an `Element`
+/// impl that:
+/// - Uses `()` for both `RequestLayoutState` and `PrepaintState`
+/// - Delegates `id()`, `source_location()`, and fiber methods to `ElementImpl`
+/// - Panics with "uses retained node path" for legacy layout methods
+///
+/// You must implement the `ElementImpl` trait to provide fiber-specific behavior:
+/// - `fn children(&self) -> &[AnyElement]` (optional, defaults to &[])
+/// - `fn children_mut(&mut self) -> &mut [AnyElement]` (optional, defaults to &mut [])
+/// - `fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>>` (required for rendering)
+/// - `fn render_node_type_id(&self) -> Option<TypeId>` (required for node reuse)
+/// - `fn update_render_node(&mut self, ...) -> Option<UpdateResult>` (required for updates)
+///
+/// # Crate Path
+///
+/// By default, the macro references types as `gpui::Type`. When used inside the gpui
+/// crate itself, use the `#[element(crate = ...)]` attribute to specify the path:
+///
+/// ```ignore
+/// // Inside the gpui crate:
+/// #[derive(Element)]
+/// #[element(crate = crate)]
+/// struct MyInternalElement { ... }
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use gpui::{Element, ElementImpl, IntoElement, RenderNode, AnyElement, UpdateResult};
+/// use std::any::TypeId;
+///
+/// #[derive(Element)]
+/// struct MyFiberElement {
+///     id: ElementId,
+///     children: SmallVec<[AnyElement; 4]>,
+/// }
+///
+/// impl IntoElement for MyFiberElement {
+///     type Element = Self;
+///     fn into_element(self) -> Self { self }
+/// }
+///
+/// impl ElementImpl for MyFiberElement {
+///     fn children(&self) -> &[AnyElement] {
+///         &self.children
+///     }
+///
+///     fn children_mut(&mut self) -> &mut [AnyElement] {
+///         &mut self.children
+///     }
+///
+///     fn create_render_node(&mut self) -> Option<Box<dyn RenderNode>> {
+///         Some(Box::new(MyNode::new()))
+///     }
+///
+///     fn render_node_type_id(&self) -> Option<TypeId> {
+///         Some(TypeId::of::<MyNode>())
+///     }
+///
+///     fn update_render_node(
+///         &mut self,
+///         node: &mut dyn RenderNode,
+///         _window: &mut Window,
+///         _cx: &mut App,
+///     ) -> Option<UpdateResult> {
+///         Some(UpdateResult::UNCHANGED)
+///     }
+/// }
+/// ```
+#[proc_macro_derive(Element, attributes(element))]
+pub fn derive_element(input: TokenStream) -> TokenStream {
+    derive_fiber_element::derive_fiber_element(input)
 }
 
 #[proc_macro_derive(Render)]

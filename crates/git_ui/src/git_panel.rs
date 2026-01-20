@@ -38,7 +38,7 @@ use gpui::{
     Action, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Corner, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent, Point,
     PromptLevel, ScrollStrategy, Subscription, Task, UniformListScrollHandle, WeakEntity, actions,
-    anchored, deferred, point, size, uniform_list,
+    anchored, point, size, uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, File};
@@ -5488,13 +5488,11 @@ impl Render for GitPanel {
                     .into_any_element(),
             )
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(Corner::TopLeft)
-                        .child(menu.clone()),
-                )
-                .with_priority(1)
+                anchored()
+                    .position(*position)
+                    .anchor(Corner::TopLeft)
+                    .child(menu.clone())
+                    .z_index(1)
             }))
     }
 }

@@ -10,10 +10,8 @@ extern crate self as gpui;
 mod action;
 mod app;
 
-mod arena;
 mod asset_cache;
 mod assets;
-mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
@@ -22,19 +20,23 @@ mod elements;
 mod executor;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
+mod fiber;
 mod geometry;
 mod global;
 mod input;
 mod inspector;
 mod interactive;
+mod intrinsic_size;
 mod key_dispatch;
 mod keymap;
 mod path_builder;
 mod platform;
 pub mod prelude;
 mod profiler;
+mod measurement_cache;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod queue;
+mod render_node;
 mod scene;
 mod shared_string;
 mod shared_uri;
@@ -47,6 +49,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod transform;
 mod util;
 mod view;
 mod window;
@@ -73,7 +76,6 @@ mod seal {
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
-pub(crate) use arena::*;
 pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
@@ -81,13 +83,18 @@ pub use ctor::ctor;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
+pub(crate) use fiber::*;
 pub use geometry::*;
 pub use global::*;
-pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
+pub use gpui_macros::{
+    AppContext, Element, IntoElement, Render, VisualContext, register_action, test,
+};
 pub use http_client;
 pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
+pub use intrinsic_size::*;
+pub use measurement_cache::*;
 use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;
@@ -96,6 +103,7 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
+pub use render_node::*;
 pub use scene::*;
 pub use shared_string::*;
 pub use shared_uri::*;
@@ -105,11 +113,12 @@ pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
-use taffy::TaffyLayoutEngine;
-pub use taffy::{AvailableSpace, LayoutId};
+pub use taffy::{AvailableSpace, LayoutId, ToTaffy};
+pub use ::taffy::style::Style as TaffyStyle;
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
+pub use transform::*;
 pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
 pub use view::*;
 pub use window::*;

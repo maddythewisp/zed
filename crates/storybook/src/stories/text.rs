@@ -1,6 +1,6 @@
 use gpui::{
-    App, AppContext as _, Context, Entity, HighlightStyle, InteractiveText, IntoElement,
-    ParentElement, Render, Styled, StyledText, Window, div, green, red,
+    App, AppContext as _, Context, Entity, HighlightStyle, IntoElement, ParentElement, Render,
+    Styled, TextElement, Window, div, green, red,
 };
 use indoc::indoc;
 use story::*;
@@ -79,9 +79,8 @@ impl Render for TextStory {
                     .child(
                         StoryItem::new(
                             "Interactive Text",
-                            InteractiveText::new(
-                                "interactive",
-                                StyledText::new("Hello world, how is it going?").with_default_highlights(
+                            "Hello world, how is it going?"
+                                .with_default_highlights(
                                     &window.text_style(),
                                     [
                                         (
@@ -92,25 +91,22 @@ impl Render for TextStory {
                                             },
                                         ),
                                     ],
-                                ),
-                            )
-                            .on_click(vec![2..4, 1..3, 7..9], |range_ix, _, _cx| {
-                                println!("Clicked range {range_ix}");
-                            }),
+                                )
+                                .on_click(vec![2..4, 1..3, 7..9], |range_ix, _, _cx| {
+                                    println!("Clicked range {range_ix}");
+                                }),
                         )
                         .usage(indoc! {r##"
-                            InteractiveText::new(
-                                "interactive",
-                                StyledText::new("Hello world, how is it going?").with_highlights(&window.text_style(), [
+                            "Hello world, how is it going?"
+                                .with_default_highlights(&window.text_style(), [
                                     (6..11, HighlightStyle {
                                         background_color: Some(green()),
                                         ..Default::default()
                                     }),
-                                ]),
-                            )
-                            .on_click(vec![2..4, 1..3, 7..9], |range_ix, _cx| {
-                                println!("Clicked range {range_ix}");
-                            })
+                                ])
+                                .on_click(vec![2..4, 1..3, 7..9], |range_ix, _, cx| {
+                                    println!("Clicked range {range_ix}");
+                                })
                             "##
                         }),
                     ),

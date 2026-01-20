@@ -3,7 +3,7 @@ use gpui::{
     App, AppContext, Application, Asset as _, AssetLogger, Bounds, ClickEvent, Context, ElementId,
     Entity, ImageAssetLoader, ImageCache, ImageCacheProvider, KeyBinding, Menu, MenuItem,
     RetainAllImageCache, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, hash, image_cache, img, prelude::*, px, rgb, size,
+    actions, div, hash, img, prelude::*, px, rgb, size,
 };
 use reqwest_client::ReqwestClient;
 use std::{collections::HashMap, sync::Arc};
@@ -98,8 +98,9 @@ impl Render for ImageGallery {
             .child(
                 "Automatically managed image cache:"
             )
-            .child(image_cache(simple_lru_cache("lru-cache", IMAGES_IN_GALLERY)).child(
+            .child(
                 div()
+                    .image_cache(simple_lru_cache("lru-cache", IMAGES_IN_GALLERY))
                     .id("main")
                     .bg(rgb(0xE9E9E9))
                     .text_color(gpui::black())
@@ -124,7 +125,7 @@ impl Render for ImageGallery {
                                     .map(|ix| img(format!("{}-{}", image_url, ix)).size_20()),
                             ),
                     )
-            ))
+            )
     }
 }
 
